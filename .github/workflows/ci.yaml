@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: aliyun
+    runs-on: self-hosted
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
