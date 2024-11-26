@@ -14,7 +14,7 @@
 # limitations under the License.
 ################################################################################
 
-name: Fluss CI on JDK 8
+name: Tests on JDK 8
 
 on:
   push:
@@ -44,7 +44,6 @@ jobs:
       - name: Build
         run: mvn -T 1C -B clean install -DskipTests
       - name: Test
-        timeout-minutes: 60
         run: |
           mvn -T 1C -B verify
         env:
