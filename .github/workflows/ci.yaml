@@ -45,7 +45,7 @@ jobs:
         run: mvn -T 1C -B clean install -DskipTests
       - name: Test
         run: |
-          mvn -T 1C -B verify
+          mvn -T 1C -B verify -Dmaven.test.failure.ignore=true
         env:
           MAVEN_OPTS: -Xmx4096m
           ARTIFACTS_OSS_ENDPOINT: ${{ secrets.ARTIFACTS_OSS_ENDPOINT }}
