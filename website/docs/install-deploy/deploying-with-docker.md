@@ -220,9 +220,8 @@ using the `docker-compose up -d` commands in a detached mode.
 ### Create docker-compose.yml file
 
 #### Compose file to start Fluss cluster with one TabletServer
+You can use the following `docker-compose.yml` file to start a Fluss cluster with one `CoordinatorServer` and one `TabletServer`.
 
-To build a 1 coordinatorServer and 1 TabletServer cluster for testing propose.
-The `docker-compose.yml` file is as follows:
 ```yaml
 services:
   coordinator-server:
@@ -247,6 +246,7 @@ services:
         zookeeper.address: zookeeper:2181
         tablet-server.host: tablet-server
         tablet-server.id: 0
+        kv.snapshot.interval: 0s
         data.dir: /tmp/fluss/data
         remote.data.dir: /tmp/fluss/remote-data
     volumes:
@@ -265,7 +265,8 @@ volumes:
 
 #### Compose file to start Fluss cluster with multi TabletServer
 
-To build a 1 coordinatorServer and 3 TabletServer. The `docker-compose.yml` file is as follows:
+You can use the following `docker-compose.yml` file to start a Fluss cluster with one `CoordinatorServer` and three `TabletServers`.
+
 ```yaml
 services:
   coordinator-server:
