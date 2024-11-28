@@ -379,6 +379,7 @@ services:
         zookeeper.address: zookeeper:2181
         tablet-server.host: tablet-server-0
         tablet-server.id: 0
+        kv.snapshot.interval: 0s
         data.dir: /tmp/fluss/data/tablet-server-0
         remote.data.dir: /tmp/fluss/remote-data
     volumes:
@@ -394,6 +395,7 @@ services:
         zookeeper.address: zookeeper:2181
         tablet-server.host: tablet-server-1
         tablet-server.id: 1
+        kv.snapshot.interval: 0s
         data.dir: /tmp/fluss/data/tablet-server-1
         remote.data.dir: /tmp/fluss/remote-data
     volumes:
@@ -409,6 +411,7 @@ services:
         zookeeper.address: zookeeper:2181
         tablet-server.host: tablet-server-2
         tablet-server.id: 2
+        kv.snapshot.interval: 0s
         data.dir: /tmp/fluss/data/tablet-server-2
         remote.data.dir: /tmp/fluss/remote-data
     volumes:
