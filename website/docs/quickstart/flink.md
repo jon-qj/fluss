@@ -26,6 +26,9 @@ cd fluss-quickstart-flink
 ```
 
 2. Create `docker-compose.yml` file with the following content:
+
+> **Note:** Depending on the docker-compose version installed on your system, you might need to specify a version field at the beginning of your yaml file.
+
 ```yaml
 services:
   coordinator-server:
@@ -207,7 +210,7 @@ END;
 ```
 
 Fluss primary-key tables support high QPS point lookup queries on primary keys. Performing a [lookup join](https://nightlies.apache.org/flink/flink-docs-release-1.20/docs/dev/table/sql/queries/joins/#lookup-join) is really efficient and you can use it to enrich
-to enrich the `fluss_orders` table with information from the `fluss_customer` and `fluss_nation` primary-key tables.
+the `fluss_orders` table with information from the `fluss_customer` and `fluss_nation` primary-key tables.
 
 ```sql  title="Flink SQL Client"
 INSERT INTO enriched_orders
