@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #
-# Copyright (c) 2024 Alibaba Group Holding Ltd.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
 #      http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -30,6 +32,11 @@ constructFlussClassPath() {
         fi
     done < <(find "$FLUSS_LIB_DIR" ! -type d -name '*.jar' -print0 | sort -z)
 
+    # Add Hadoop dependencies from environment variables HADOOP_CLASSPATH
+    if [ -n "${HADOOP_CLASSPATH}" ]; then
+        FLUSS_CLASSPATH="$FLUSS_CLASSPATH":"$HADOOP_CLASSPATH"
+    fi
+
     local FLUSS_SERVER_COUNT
     FLUSS_SERVER_COUNT="$(echo "$FLUSS_SERVER" | tr -s ':' '\n' | grep -v '^$' | wc -l)"
 
@@ -44,32 +51,6 @@ constructFlussClassPath() {
     fi
 
     echo "$FLUSS_CLASSPATH""$FLUSS_SERVER"
-}
-
-constructPluginJars() {
-  plugin="$1"
-  local PLUGIN_JARS=()
-  while read -d '' -r jarfile ; do
-      if [[ "$jarfile" =~ .*/$plugin/[^/]*.jar$ ]]; then
-        PLUGIN_JARS+=("file://$jarfile")
-      fi
-  done < <(find "$FLUSS_PLUGINS_DIR" ! -type d -name '*.jar' -print0 | sort -z)
-
-  if [ ${#PLUGIN_JARS[@]} -gt 0 ]; then
-    IFS=';'
-    echo "${PLUGIN_JARS[*]}"
-  fi
-}
-
-constructLogClassClassPath() {
-  local LOG_CLASSPATH
-  while read -d '' -r jarfile ; do
-      if [[ "$jarfile" =~ .*/log4j[^/]*.jar$ ]]; then
-          LOG_CLASSPATH="$LOG_CLASSPATH":"$jarfile"
-      fi
-  done < <(find "$FLUSS_LIB_DIR" ! -type d -name '*.jar' -print0 | sort -z)
-
-  echo "$LOG_CLASSPATH"
 }
 
 # These are used to mangle paths that are passed to java when using
@@ -126,46 +107,6 @@ is_jdk_version_ge_17() {
   fi
 }
 
-findLakehouseCliJar() {
-  local DATA_LAKEHOUSE_CLI
-  DATA_LAKEHOUSE_CLI="$(find "$FLUSS_OPT_DIR" -name 'fluss-lakehouse-cli-*.jar')"
-  local DATA_LAKEHOUSE_CLI_COUNT
-  DATA_LAKEHOUSE_CLI_COUNT="$(echo "$DATA_LAKEHOUSE_CLI" | wc -l)"
-
-  # lakehouse-cli-*.jar cannot be resolved write error messages to stderr since stdout is stored
-  # as the classpath and exit function with empty classpath to force process failure
-  if [[ "$DATA_LAKEHOUSE_CLI" == "" ]]; then
-    (>&2 echo "[ERROR] Lakehouse cli jar not found in $FLUSS_OPT_DIR.")
-    exit 1
-  elif [[ "$DATA_LAKEHOUSE_CLI_COUNT" -gt 1 ]]; then
-    (>&2 echo "[ERROR] Multiple lakehouse-cli-*.jar found in $FLUSS_OPT_DIR. Please resolve.")
-    exit 1
-  fi
-
-  echo "$DATA_LAKEHOUSE_CLI"
-}
-
-findLakehousePaimonJar() {
-  local LAKEHOUSE_PAIMON
-  LAKEHOUSE_PAIMON="$(find "$FLUSS_OPT_DIR" -name 'fluss-lakehouse-paimon-*.jar')"
-  local LAKEHOUSE_PAIMON_COUNT
-  LAKEHOUSE_PAIMON_COUNT="$(echo "$LAKEHOUSE_PAIMON" | wc -l)"
-
-  # lakehouse-paimon-*.jar cannot be resolved write error messages to stderr since stdout is stored
-  # as the classpath and exit function with empty classpath to force process failure
-  if [[ "$LAKEHOUSE_PAIMON" == "" ]]; then
-    (>&2 echo "[ERROR] lakehouse-paimon-*.jar not found in $FLUSS_OPT_DIR.")
-    exit 1
-  elif [[ "$LAKEHOUSE_PAIMON_COUNT" -gt 1 ]]; then
-    (>&2 echo "[ERROR] Multiple lakehouse-paimon-*.jar found in $FLUSS_OPT_DIR. Please resolve.")
-    exit 1
-  fi
-
-  echo "$LAKEHOUSE_PAIMON"
-}
-
-
-
 
 # WARNING !!! , these values are only used if there is nothing else is specified in
 # conf/server.yaml
@@ -197,9 +138,6 @@ KEY_ENV_SSH_OPTS="env.ssh.opts"
 KEY_ZK_HEAP_MB="zookeeper.heap.mb"
 
 KEY_REMOTE_DATA_DIR="remote.data.dir"
-KEY_DATA_LAKE_STORAGE="lakehouse.storage"
-KEY_PAIMON_WAREHOUSE="paimon.catalog.warehouse"
-
 
 ########################################################################################################################
 # PATHS AND CONFIG
@@ -352,10 +290,6 @@ fi
 
 if [ -z "${REMOTE_DATA_DIR}" ]; then
     REMOTE_DATA_DIR=$(readFromConfig ${KEY_REMOTE_DATA_DIR} "" "${YAML_CONF}")
-fi
-
-if [ -z "${PAIMON_WAREHOUSE}" ]; then
-    PAIMON_WAREHOUSE=$(readFromConfig ${KEY_PAIMON_WAREHOUSE} "" "${YAML_CONF}")
 fi
 
 # Arguments for the JVM. Used for Coordinator server and Tablet server JVMs.
