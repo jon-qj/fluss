@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionType;
 import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
@@ -417,6 +418,26 @@ public class ConfigOptions {
                             "The interval at which to remove writer ids that have expired due to "
                                     + WRITER_ID_EXPIRATION_TIME.key()
                                     + " passing. The default value is 10 minutes.");
+
+    public static final ConfigOption<Integer> TABLET_SERVER_CONTROLLED_SHUTDOWN_MAX_RETRIES =
+            key("tablet-server.controlled-shutdown.max-retries")
+                    .intType()
+                    .defaultValue(3)
+                    .withDescription(
+                            "The maximum number of retries for controlled shutdown of the tablet server. "
+                                    + "During controlled shutdown, the tablet server attempts to transfer leadership "
+                                    + "of its buckets to other servers. If the transfer fails, it will retry up to "
+                                    + "this number of times before proceeding with shutdown. The default value is 3.");
+
+    public static final ConfigOption<Duration> TABLET_SERVER_CONTROLLED_SHUTDOWN_RETRY_INTERVAL =
+            key("tablet-server.controlled-shutdown.retry-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(1000))
+                    .withDescription(
+                            "The interval between retries during controlled shutdown of the tablet server. "
+                                    + "When controlled shutdown fails to transfer bucket leadership, the tablet server "
+                                    + "will wait for this duration before attempting the next retry. "
+                                    + "The default value is 1000 milliseconds (1 second).");
 
     public static final ConfigOption<Integer> BACKGROUND_THREADS =
             key("server.background.threads")
@@ -1360,6 +1381,18 @@ public class ConfigOptions {
                     .withDescription(
                             "The column name of the version column for the `versioned` merge engine. "
                                     + "If the merge engine is set to `versioned`, the version column must be set.");
+
+    public static final ConfigOption<DeleteBehavior> TABLE_DELETE_BEHAVIOR =
+            key("table.delete.behavior")
+                    .enumType(DeleteBehavior.class)
+                    .defaultValue(DeleteBehavior.ALLOW)
+                    .withDescription(
+                            "Defines the delete behavior for the primary key table. "
+                                    + "The supported delete behaviors are `allow`, `ignore`, and `disable`. "
+                                    + "The `allow` behavior allows normal delete operations (default). "
+                                    + "The `ignore` behavior silently skips delete requests without error. "
+                                    + "The `disable` behavior rejects delete requests with a clear error message. "
+                                    + "For tables with FIRST_ROW or VERSIONED merge engines, this option defaults to `ignore`.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv

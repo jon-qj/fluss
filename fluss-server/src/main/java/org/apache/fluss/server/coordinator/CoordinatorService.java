@@ -33,8 +33,11 @@ import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.lake.lakestorage.LakeCatalog;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.DeleteBehavior;
+import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableChange;
@@ -82,6 +85,7 @@ import org.apache.fluss.rpc.netty.server.Session;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
+import org.apache.fluss.security.acl.FlussPrincipal;
 import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.server.DynamicConfigManager;
@@ -285,7 +289,10 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         if (isDataLakeEnabled(tableDescriptor)) {
             try {
                 checkNotNull(lakeCatalogContainer.getLakeCatalog())
-                        .createTable(tablePath, tableDescriptor);
+                        .createTable(
+                                tablePath,
+                                tableDescriptor,
+                                new DefaultLakeCatalogContext(currentSession().getPrincipal()));
             } catch (TableAlreadyExistException e) {
                 throw new LakeTableAlreadyExistException(
                         String.format(
@@ -324,7 +331,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 request.isIgnoreIfNotExists(),
                 lakeCatalogContainer.getLakeCatalog(),
                 lakeCatalogContainer.getDataLakeFormat(),
-                lakeTableTieringManager);
+                lakeTableTieringManager,
+                new DefaultLakeCatalogContext(currentSession().getPrincipal()));
 
         return CompletableFuture.completedFuture(new AlterTableResponse());
     }
@@ -404,6 +412,20 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                             ConfigOptions.TABLE_DATALAKE_ENABLED.key()));
         }
 
+        // For tables with first_row or versioned merge engines, automatically set to IGNORE if
+        // delete behavior is not set
+        Configuration tableConf = Configuration.fromMap(tableDescriptor.getProperties());
+        MergeEngineType mergeEngine =
+                tableConf.getOptional(ConfigOptions.TABLE_MERGE_ENGINE).orElse(null);
+        if (mergeEngine == MergeEngineType.FIRST_ROW || mergeEngine == MergeEngineType.VERSIONED) {
+            if (tableDescriptor.hasPrimaryKey()
+                    && !tableConf.getOptional(ConfigOptions.TABLE_DELETE_BEHAVIOR).isPresent()) {
+                Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());
+                newProperties.put(
+                        ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), DeleteBehavior.IGNORE.name());
+                newDescriptor = newDescriptor.withProperties(newProperties);
+            }
+        }
         return newDescriptor;
     }
 
@@ -448,7 +470,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
         // first, validate the partition spec, and get resolved partition spec.
         PartitionSpec partitionSpec = getPartitionSpec(request.getPartitionSpec());
-        validatePartitionSpec(tablePath, table.partitionKeys, partitionSpec);
+        validatePartitionSpec(tablePath, table.partitionKeys, partitionSpec, true);
         ResolvedPartitionSpec partitionToCreate =
                 ResolvedPartitionSpec.fromPartitionSpec(table.partitionKeys, partitionSpec);
 
@@ -489,7 +511,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
         // first, validate the partition spec.
         PartitionSpec partitionSpec = getPartitionSpec(request.getPartitionSpec());
-        validatePartitionSpec(tablePath, table.partitionKeys, partitionSpec);
+        validatePartitionSpec(tablePath, table.partitionKeys, partitionSpec, false);
         ResolvedPartitionSpec partitionToDrop =
                 ResolvedPartitionSpec.fromPartitionSpec(table.partitionKeys, partitionSpec);
 
@@ -739,6 +761,20 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 throw new InvalidTableException(
                         "Creation of Log Tables is disallowed in the cluster.");
             }
+        }
+    }
+
+    static class DefaultLakeCatalogContext implements LakeCatalog.Context {
+
+        private final FlussPrincipal flussPrincipal;
+
+        public DefaultLakeCatalogContext(FlussPrincipal flussPrincipal) {
+            this.flussPrincipal = flussPrincipal;
+        }
+
+        @Override
+        public FlussPrincipal getFlussPrincipal() {
+            return flussPrincipal;
         }
     }
 }

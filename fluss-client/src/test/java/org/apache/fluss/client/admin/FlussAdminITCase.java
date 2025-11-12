@@ -50,6 +50,7 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.FsPathAndFileName;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
+import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PartitionInfo;
@@ -85,8 +86,12 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
+import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
+import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
 import static org.apache.fluss.metadata.DataLakeFormat.PAIMON;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -203,6 +208,23 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         // assert created time
         assertThat(tableInfo.getCreatedTime())
                 .isBetween(timestampBeforeCreate, timestampAfterCreate);
+
+        // test sensitive lake catalog properties have been removed
+        tablePath = TablePath.of("test_db", "lake_table");
+        admin.createTable(
+                        tablePath,
+                        DEFAULT_TABLE_DESCRIPTOR.withProperties(
+                                new HashMap<String, String>() {
+                                    {
+                                        put("table.datalake.enabled", "true");
+                                    }
+                                }),
+                        false)
+                .get();
+        Map<String, String> properties =
+                admin.getTableInfo(tablePath).get().getProperties().toMap();
+        assertThat(properties.containsKey("table.datalake.paimon.jdbc.user")).isTrue();
+        assertThat(properties.containsKey("table.datalake.paimon.jdbc.password")).isFalse();
     }
 
     @Test
@@ -281,7 +303,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testCreateInvalidDatabaseAndTable() {
+    void testCreateInvalidDatabaseAndTable() throws Exception {
         assertThatThrownBy(
                         () ->
                                 admin.createDatabase(
@@ -290,6 +312,15 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 .isInstanceOf(InvalidDatabaseException.class)
                 .hasMessageContaining(
                         "Database name *invalid_db* is invalid: '*invalid_db*' contains one or more characters other than");
+        //  test internal database with '__' prefix is not allowed
+        assertThatThrownBy(
+                        () ->
+                                admin.createDatabase(
+                                                "__internal_db", DatabaseDescriptor.EMPTY, false)
+                                        .get())
+                .isInstanceOf(InvalidDatabaseException.class)
+                .hasMessageContaining(
+                        "Database name __internal_db is invalid: '__' is not allowed as prefix, since it is reserved for internal databases/internal tables/internal partitions in Fluss server");
         assertThatThrownBy(
                         () ->
                                 admin.createTable(
@@ -309,6 +340,103 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                                         .get())
                 .isInstanceOf(InvalidDatabaseException.class)
                 .hasMessageContaining("Database name null is invalid: null string is not allowed");
+        //  test internal table with '__' prefix is not allowed
+        assertThatThrownBy(
+                        () ->
+                                admin.createTable(
+                                                TablePath.of("db", "__internal_table"),
+                                                DEFAULT_TABLE_DESCRIPTOR,
+                                                false)
+                                        .get())
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining(
+                        "Table name __internal_table is invalid: '__' is not allowed as prefix, since it is reserved for internal databases/internal tables/internal partitions in Fluss server");
+    }
+
+    @Test
+    void testCreateTableWithDeleteBehavior() {
+        // Test 1: FIRST_ROW merge engine - should set delete behavior to IGNORE
+        TablePath tablePath1 = TablePath.of("fluss", "test_ignore_delete_for_first_row");
+        Map<String, String> properties1 = new HashMap<>();
+        properties1.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "first_row");
+
+        TableDescriptor tableDescriptor1 =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("first row merge engine table")
+                        .properties(properties1)
+                        .build();
+        admin.createTable(tablePath1, tableDescriptor1, false).join();
+
+        // Get the table and verify delete behavior is changed to IGNORE
+        TableInfo tableInfo1 = admin.getTableInfo(tablePath1).join();
+        assertThat(tableInfo1.getTableConfig().getDeleteBehavior()).hasValue(DeleteBehavior.IGNORE);
+
+        // Test 2: VERSIONED merge engine - should set delete behavior to IGNORE
+        TablePath tablePath2 = TablePath.of("fluss", "test_ignore_delete_for_versioned");
+        Map<String, String> properties2 = new HashMap<>();
+        properties2.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "versioned");
+        properties2.put(ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(), "age");
+        TableDescriptor tableDescriptor2 =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("versioned merge engine table")
+                        .properties(properties2)
+                        .build();
+        admin.createTable(tablePath2, tableDescriptor2, false).join();
+        // Get the table and verify delete behavior is changed to IGNORE
+        TableInfo tableInfo2 = admin.getTableInfo(tablePath2).join();
+        assertThat(tableInfo2.getTableConfig().getDeleteBehavior()).hasValue(DeleteBehavior.IGNORE);
+
+        // Test 3: FIRST_ROW merge engine with delete behavior explicitly set to ALLOW
+        TablePath tablePath3 = TablePath.of("fluss", "test_allow_delete_for_first_row");
+        Map<String, String> properties3 = new HashMap<>();
+        properties3.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "first_row");
+        properties3.put(ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), "ALLOW");
+        TableDescriptor tableDescriptor3 =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("first row merge engine table")
+                        .properties(properties3)
+                        .build();
+        assertThatThrownBy(() -> admin.createTable(tablePath3, tableDescriptor3, false).join())
+                .hasRootCauseInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(
+                        "Table with 'FIRST_ROW' merge engine does not support delete operations. "
+                                + "The 'table.delete.behavior' config must be set to 'ignore' or 'disable', but got 'allow'.");
+
+        // Test 4: VERSIONED merge engine with delete behavior explicitly set to ALLOW
+        TablePath tablePath4 = TablePath.of("fluss", "test_allow_delete_for_versioned");
+        Map<String, String> properties4 = new HashMap<>();
+        properties4.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "versioned");
+        properties4.put(ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(), "age");
+        properties4.put(ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), "ALLOW");
+        TableDescriptor tableDescriptor4 =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("versioned merge engine table")
+                        .properties(properties4)
+                        .build();
+        assertThatThrownBy(() -> admin.createTable(tablePath4, tableDescriptor4, false).join())
+                .hasRootCauseInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(
+                        "Table with 'VERSIONED' merge engine does not support delete operations. "
+                                + "The 'table.delete.behavior' config must be set to 'ignore' or 'disable', but got 'allow'.");
+
+        // Test 5: Log table - not allow to set delete behavior
+        TablePath tablePath5 = TablePath.of("fluss", "test_set_delete_behavior_for_log_table");
+        Map<String, String> properties5 = new HashMap<>();
+        properties5.put(ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), "IGNORE");
+        TableDescriptor tableDescriptor5 =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA)
+                        .comment("log table")
+                        .properties(properties5)
+                        .build();
+        assertThatThrownBy(() -> admin.createTable(tablePath5, tableDescriptor5, false).join())
+                .hasRootCauseInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(
+                        "The 'table.delete.behavior' configuration is only supported for primary key tables.");
     }
 
     @Test
@@ -748,6 +876,21 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         admin.createTable(tablePath, partitionedTable, true).get();
         assertPartitionInfo(admin.listPartitionInfos(tablePath).get(), Collections.emptyList());
 
+        // test internal partition with '__' prefix is not allowed
+        assertThatThrownBy(
+                        () ->
+                                admin.createPartition(
+                                                tablePath,
+                                                newPartitionSpec(
+                                                        Arrays.asList("age"),
+                                                        Arrays.asList("__18")),
+                                                false)
+                                        .get())
+                .cause()
+                .isInstanceOf(InvalidPartitionException.class)
+                .hasMessageContaining(
+                        "The partition value __18 is invalid: '__' is not allowed as prefix, since it is reserved for internal databases/internal tables/internal partitions in Fluss server");
+
         // add two partitions.
         admin.createPartition(tablePath, newPartitionSpec("age", "10"), false).get();
         admin.createPartition(tablePath, newPartitionSpec("age", "11"), false).get();
@@ -947,7 +1090,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testDynamicConfigs() throws ExecutionException, InterruptedException {
+    void testDynamicConfigs() throws Exception {
         assertThat(
                         FLUSS_CLUSTER_EXTENSION
                                 .getCoordinatorServer()
@@ -969,20 +1112,37 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertConfigEntry(
                 DATALAKE_FORMAT.key(), null, ConfigEntry.ConfigSource.DYNAMIC_SERVER_CONFIG);
 
-        // Delete dynamic configs to use the initial value(from server.yaml)
         admin.alterClusterConfigs(
-                        Collections.singletonList(
+                        Arrays.asList(
                                 new AlterConfig(
-                                        DATALAKE_FORMAT.key(), null, AlterConfigOpType.DELETE)))
+                                        DATALAKE_FORMAT.key(), "paimon", AlterConfigOpType.SET),
+                                new AlterConfig(
+                                        "datalake.paimon.warehouse",
+                                        "test-warehouse",
+                                        AlterConfigOpType.SET)))
                 .get();
-        assertThat(
-                        FLUSS_CLUSTER_EXTENSION
-                                .getCoordinatorServer()
-                                .getCoordinatorService()
-                                .getDataLakeFormat())
-                .isEqualTo(PAIMON);
-        assertConfigEntry(
-                DATALAKE_FORMAT.key(), "paimon", ConfigEntry.ConfigSource.INITIAL_SERVER_CONFIG);
+        TablePath tablePath = TablePath.of("test_db", "test_table");
+        createTable(
+                tablePath,
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .property(TABLE_DATALAKE_ENABLED, true)
+                        .build(),
+                true);
+
+        waitUntil(
+                () -> {
+                    TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+                    Map<String, String> tableProperties = tableInfo.getProperties().toMap();
+                    return tableProperties.containsKey(TABLE_DATALAKE_FORMAT.key())
+                            && tableProperties.containsKey("table.datalake.paimon.warehouse")
+                            && PAIMON.toString()
+                                    .equals(tableProperties.get(TABLE_DATALAKE_FORMAT.key()))
+                            && "test-warehouse"
+                                    .equals(tableProperties.get("table.datalake.paimon.warehouse"));
+                },
+                Duration.ofMinutes(1),
+                "Get lakehouse info");
     }
 
     private void assertConfigEntry(
