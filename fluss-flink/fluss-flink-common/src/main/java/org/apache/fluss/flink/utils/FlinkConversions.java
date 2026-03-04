@@ -21,8 +21,11 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOption;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.config.Password;
+import org.apache.fluss.flink.adapter.CatalogTableAdapter;
 import org.apache.fluss.flink.catalog.FlinkCatalogFactory;
+import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -58,13 +61,18 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.table.factories.FactoryUtil.CONNECTOR;
 import static org.apache.flink.table.utils.EncodingUtils.decodeBase64ToBytes;
 import static org.apache.flink.table.utils.EncodingUtils.encodeBytesToBase64;
 import static org.apache.flink.util.Preconditions.checkNotNull;
+import static org.apache.flink.util.Preconditions.checkState;
+import static org.apache.fluss.config.ConfigOptions.TABLE_MERGE_ENGINE;
 import static org.apache.fluss.config.FlussConfigUtils.isTableStorageConfig;
+import static org.apache.fluss.flink.FlinkConnectorOptions.AUTO_INCREMENT_FIELDS;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BUCKET_KEY;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BUCKET_NUMBER;
 import static org.apache.fluss.flink.FlinkConnectorOptions.MATERIALIZED_TABLE_DEFINITION_QUERY;
@@ -123,6 +131,14 @@ public class FlinkConversions {
         }
 
         Schema schema = tableInfo.getSchema();
+
+        // convert aggregation functions to flink options
+        for (Schema.Column column : schema.getColumns()) {
+            if (column.getAggFunction().isPresent()) {
+                FlinkAggFunctionParser.formatAggFunctionToOptions(
+                        column.getName(), column.getAggFunction().get(), newOptions);
+            }
+        }
         List<String> physicalColumns = schema.getColumnNames();
         int columnCount =
                 physicalColumns.size()
@@ -193,21 +209,39 @@ public class FlinkConversions {
             schemBuilder.primaryKey(resolvedSchema.getPrimaryKey().get().getColumns());
         }
 
-        // first build schema with physical columns
-        Schema schema =
-                schemBuilder
-                        .fromColumns(
-                                resolvedSchema.getColumns().stream()
-                                        .filter(Column::isPhysical)
-                                        .map(
-                                                column ->
-                                                        new Schema.Column(
-                                                                column.getName(),
-                                                                FlinkConversions.toFlussType(
-                                                                        column.getDataType()),
-                                                                column.getComment().orElse(null)))
-                                        .collect(Collectors.toList()))
-                        .build();
+        // Check if aggregation merge engine is enabled to optimize parsing
+        boolean isAggregationEngine = isAggregationMergeEngine(flinkTableConf);
+
+        // Build schema with physical columns
+        resolvedSchema.getColumns().stream()
+                .filter(Column::isPhysical)
+                .forEachOrdered(
+                        column ->
+                                addColumnToSchema(
+                                        schemBuilder, column, flinkTableConf, isAggregationEngine));
+
+        // Configure auto-increment columns based on the 'auto-increment.fields' option.
+        if (flinkTableConf.containsKey(AUTO_INCREMENT_FIELDS.key())) {
+            for (String autoIncrementColumn :
+                    flinkTableConf.get(AUTO_INCREMENT_FIELDS).split(",")) {
+                schemBuilder.enableAutoIncrement(autoIncrementColumn.trim());
+            }
+        }
+
+        // convert some flink options to fluss table configs.
+        Map<String, String> storageProperties =
+                convertFlinkOptionsToFlussTableProperties(flinkTableConf);
+
+        // serialize computed column and watermark spec to custom properties
+        Map<String, String> customProperties =
+                extractCustomProperties(flinkTableConf, storageProperties);
+        CatalogPropertiesUtils.serializeComputedColumns(
+                customProperties, resolvedSchema.getColumns());
+        CatalogPropertiesUtils.serializeWatermarkSpecs(
+                customProperties, catalogBaseTable.getResolvedSchema().getWatermarkSpecs());
+
+        Schema schema = schemBuilder.build();
+
         resolvedSchema.getColumns().stream()
                 .filter(col -> col instanceof Column.MetadataColumn)
                 .findAny()
@@ -223,14 +257,8 @@ public class FlinkConversions {
                         ? ((ResolvedCatalogTable) catalogBaseTable).getPartitionKeys()
                         : ((ResolvedCatalogMaterializedTable) catalogBaseTable).getPartitionKeys();
 
-        Map<String, String> customProperties = flinkTableConf.toMap();
-        CatalogPropertiesUtils.serializeComputedColumns(
-                customProperties, resolvedSchema.getColumns());
-        CatalogPropertiesUtils.serializeWatermarkSpecs(
-                customProperties, catalogBaseTable.getResolvedSchema().getWatermarkSpecs());
-
         // Set materialized table flags to fluss table custom properties
-        if (CatalogBaseTable.TableKind.MATERIALIZED_TABLE == tableKind) {
+        if (CatalogTableAdapter.isMaterializedTable(tableKind)) {
             CatalogMaterializedTable.RefreshMode refreshMode =
                     ((ResolvedCatalogMaterializedTable) catalogBaseTable).getRefreshMode();
             if (refreshMode == CatalogMaterializedTable.RefreshMode.FULL) {
@@ -242,9 +270,6 @@ public class FlinkConversions {
         }
 
         String comment = catalogBaseTable.getComment();
-
-        // convert some flink options to fluss table configs.
-        Map<String, String> properties = convertFlinkOptionsToFlussTableProperties(flinkTableConf);
 
         // then set distributed by information
         List<String> bucketKey;
@@ -273,7 +298,7 @@ public class FlinkConversions {
                 .partitionedBy(partitionKeys)
                 .distributedBy(bucketNum, bucketKey)
                 .comment(comment)
-                .properties(properties)
+                .properties(storageProperties)
                 .customProperties(customProperties)
                 .build();
     }
@@ -394,6 +419,44 @@ public class FlinkConversions {
             return Collections.singletonList(
                     convertSetOption(
                             (org.apache.flink.table.catalog.TableChange.SetOption) tableChange));
+        } else if (tableChange instanceof org.apache.flink.table.catalog.TableChange.AddColumn) {
+            org.apache.flink.table.catalog.TableChange.AddColumn addColumn =
+                    (org.apache.flink.table.catalog.TableChange.AddColumn) tableChange;
+            Column column = addColumn.getColumn();
+            return Collections.singletonList(
+                    TableChange.addColumn(
+                            column.getName(),
+                            toFlussType(column.getDataType()),
+                            column.getComment().orElse(null),
+                            toFlussColumnPosition(addColumn.getPosition())));
+        } else if (tableChange instanceof org.apache.flink.table.catalog.TableChange.DropColumn) {
+            return Collections.singletonList(
+                    TableChange.dropColumn(
+                            ((org.apache.flink.table.catalog.TableChange.DropColumn) tableChange)
+                                    .getColumnName()));
+        } else if (tableChange
+                instanceof org.apache.flink.table.catalog.TableChange.ModifyColumnName) {
+            org.apache.flink.table.catalog.TableChange.ModifyColumnName renameColumn =
+                    (org.apache.flink.table.catalog.TableChange.ModifyColumnName) tableChange;
+            return Collections.singletonList(
+                    TableChange.renameColumn(
+                            renameColumn.getOldColumn().getName(),
+                            renameColumn.getNewColumnName()));
+        } else if (tableChange instanceof org.apache.flink.table.catalog.TableChange.ModifyColumn) {
+            org.apache.flink.table.catalog.TableChange.ModifyColumn modifyColumn =
+                    (org.apache.flink.table.catalog.TableChange.ModifyColumn) tableChange;
+            checkState(
+                    Objects.equals(
+                            modifyColumn.getNewColumn().getName(),
+                            modifyColumn.getOldColumn().getName()),
+                    "Can only modify columns with the same name.");
+            Column newColumn = modifyColumn.getNewColumn();
+            return Collections.singletonList(
+                    TableChange.modifyColumn(
+                            newColumn.getName(),
+                            toFlussType(newColumn.getDataType()),
+                            newColumn.getComment().orElse(null),
+                            toFlussColumnPosition(modifyColumn.getNewPosition())));
         } else if (tableChange instanceof org.apache.flink.table.catalog.TableChange.ResetOption) {
             return Collections.singletonList(
                     convertResetOption(
@@ -405,6 +468,21 @@ public class FlinkConversions {
         } else {
             throw new UnsupportedOperationException(
                     String.format("Unsupported flink table change: %s.", tableChange));
+        }
+    }
+
+    private static TableChange.ColumnPosition toFlussColumnPosition(
+            org.apache.flink.table.catalog.TableChange.ColumnPosition columnPosition) {
+        if (columnPosition == null) {
+            return TableChange.ColumnPosition.last();
+        } else if (columnPosition instanceof org.apache.flink.table.catalog.TableChange.First) {
+            return TableChange.ColumnPosition.first();
+        } else if (columnPosition instanceof org.apache.flink.table.catalog.TableChange.After) {
+            return TableChange.ColumnPosition.after(
+                    ((org.apache.flink.table.catalog.TableChange.After) columnPosition).column());
+        } else {
+            throw new UnsupportedOperationException(
+                    String.format("Unsupported column position: %s.", columnPosition));
         }
     }
 
@@ -580,5 +658,57 @@ public class FlinkConversions {
                 .refreshHandlerDescription(refreshHandlerDesc)
                 .serializedRefreshHandler(refreshHandlerBytes);
         return builder.build();
+    }
+
+    /**
+     * Check if the table uses aggregation merge engine.
+     *
+     * @param tableConf the table configuration
+     * @return true if aggregation merge engine is enabled, false otherwise
+     */
+    private static boolean isAggregationMergeEngine(Configuration tableConf) {
+        String mergeEngineStr = tableConf.getString(TABLE_MERGE_ENGINE.key(), null);
+        return mergeEngineStr != null
+                && MergeEngineType.fromString(mergeEngineStr) == MergeEngineType.AGGREGATION;
+    }
+
+    /**
+     * Add a column to the schema builder with optional aggregation function.
+     *
+     * @param schemaBuilder the schema builder
+     * @param column the Flink column
+     * @param tableConf the table configuration
+     * @param parseAggFunction whether to parse aggregation function from config
+     */
+    private static void addColumnToSchema(
+            Schema.Builder schemaBuilder,
+            Column column,
+            Configuration tableConf,
+            boolean parseAggFunction) {
+        String columnName = column.getName();
+        DataType flussDataType = toFlussType(column.getDataType());
+
+        // Parse and add aggregation function if needed
+        if (parseAggFunction) {
+            Optional<AggFunction> aggFunction =
+                    FlinkAggFunctionParser.parseAggFunction(columnName, flussDataType, tableConf);
+            if (aggFunction.isPresent()) {
+                schemaBuilder.column(columnName, flussDataType, aggFunction.get());
+            } else {
+                schemaBuilder.column(columnName, flussDataType);
+            }
+        } else {
+            schemaBuilder.column(columnName, flussDataType);
+        }
+
+        // Add comment if present
+        column.getComment().ifPresent(schemaBuilder::withComment);
+    }
+
+    private static Map<String, String> extractCustomProperties(
+            Configuration allProperties, Map<String, String> flussTableProperties) {
+        Map<String, String> customProperties = new HashMap<>(allProperties.toMap());
+        customProperties.keySet().removeAll(flussTableProperties.keySet());
+        return customProperties;
     }
 }

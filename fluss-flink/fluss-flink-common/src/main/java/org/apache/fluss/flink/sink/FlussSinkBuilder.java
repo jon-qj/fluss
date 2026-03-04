@@ -24,8 +24,10 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.sink.serializer.FlussSerializationSchema;
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
 import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 
@@ -33,11 +35,13 @@ import org.apache.flink.table.types.logical.RowType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
+import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.validateDistributionModeForMergeEngine;
 import static org.apache.fluss.flink.utils.FlinkConversions.toFlinkRowType;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -72,7 +76,12 @@ public class FlussSinkBuilder<InputT> {
     private String tableName;
     private final Map<String, String> configOptions = new HashMap<>();
     private FlussSerializationSchema<InputT> serializationSchema;
-    private boolean shuffleByBucketId = true;
+    private DistributionMode distributionMode = DistributionMode.AUTO;
+    // Optional list of columns for partial update. When set, upsert will only update these columns.
+    // The primary key columns must be fully specified in this list.
+    private List<String> partialUpdateColumns;
+    // Optional producer ID for undo recovery. If not set, defaults to the Flink job ID.
+    private String producerId;
 
     /** Set the bootstrap server for the sink. */
     public FlussSinkBuilder<InputT> setBootstrapServers(String bootstrapServers) {
@@ -92,9 +101,58 @@ public class FlussSinkBuilder<InputT> {
         return this;
     }
 
-    /** Set shuffle by bucket id. */
+    /**
+     * Set shuffle by bucket id. Deprecated use {@link
+     * FlussSinkBuilder#setDistributionMode(DistributionMode) } instead.
+     */
+    @Deprecated
     public FlussSinkBuilder<InputT> setShuffleByBucketId(boolean shuffleByBucketId) {
-        this.shuffleByBucketId = shuffleByBucketId;
+        this.distributionMode = shuffleByBucketId ? DistributionMode.BUCKET : DistributionMode.NONE;
+        return this;
+    }
+
+    /**
+     * Set the distribution mode for the sink. The distribution mode controls how records are
+     * shuffled to the Fluss sink operator.
+     *
+     * @param distributionMode
+     * @return
+     */
+    public FlussSinkBuilder<InputT> setDistributionMode(DistributionMode distributionMode) {
+        this.distributionMode = distributionMode;
+        return this;
+    }
+
+    /**
+     * Enable partial update by specifying the column names to update for upsert tables. Primary key
+     * columns must be included in this list.
+     */
+    public FlussSinkBuilder<InputT> setPartialUpdateColumns(List<String> columns) {
+        this.partialUpdateColumns = columns;
+        return this;
+    }
+
+    /**
+     * Enable partial update by specifying the column names to update for upsert tables. Convenience
+     * varargs overload.
+     */
+    public FlussSinkBuilder<InputT> setPartialUpdateColumns(String... columns) {
+        this.partialUpdateColumns = Arrays.asList(columns);
+        return this;
+    }
+
+    /**
+     * Set the producer ID for undo recovery. If not set, defaults to the Flink job ID.
+     *
+     * <p>This option is useful for testing or when you need to maintain the same producer ID across
+     * different job submissions. The producer ID is used to track producer offsets for undo
+     * recovery during checkpoint restoration.
+     *
+     * @param producerId the producer ID to use
+     * @return this builder
+     */
+    public FlussSinkBuilder<InputT> setProducerId(String producerId) {
+        this.producerId = producerId;
         return this;
     }
 
@@ -151,20 +209,35 @@ public class FlussSinkBuilder<InputT> {
 
         boolean isUpsert = tableInfo.hasPrimaryKey();
 
+        // Detect if this is an aggregation table that needs undo recovery
+        MergeEngineType mergeEngineType =
+                tableInfo.getTableConfig().getMergeEngineType().orElse(null);
+        boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
+
         if (isUpsert) {
+            // Validate distribution mode for primary key tables with merge engine
+            validateDistributionModeForMergeEngine(mergeEngineType, distributionMode);
+
             LOG.info("Initializing Fluss upsert sink writer ...");
+            int[] targetColumnIndexes =
+                    computeTargetColumnIndexes(
+                            tableRowType.getFieldNames(),
+                            tableInfo.getPrimaryKeys(),
+                            partialUpdateColumns);
             writerBuilder =
                     new FlinkSink.UpsertSinkWriterBuilder<>(
                             tablePath,
                             flussConfig,
                             tableRowType,
-                            null, // not support partialUpdateColumns yet
+                            targetColumnIndexes,
                             numBucket,
                             bucketKeys,
                             partitionKeys,
                             lakeFormat,
-                            shuffleByBucketId,
-                            serializationSchema);
+                            distributionMode,
+                            serializationSchema,
+                            enableUndoRecovery,
+                            producerId);
         } else {
             LOG.info("Initializing Fluss append sink writer ...");
             writerBuilder =
@@ -176,11 +249,11 @@ public class FlussSinkBuilder<InputT> {
                             bucketKeys,
                             partitionKeys,
                             lakeFormat,
-                            shuffleByBucketId,
+                            distributionMode,
                             serializationSchema);
         }
 
-        return new FlussSink<>(writerBuilder);
+        return new FlussSink<>(writerBuilder, tablePath);
     }
 
     private void validateConfiguration() {
@@ -192,5 +265,49 @@ public class FlussSinkBuilder<InputT> {
 
         checkNotNull(tableName, "Table name is required but not provided.");
         checkArgument(!tableName.isEmpty(), "Table name cannot be empty.");
+    }
+
+    // -------------- Test-visible helper methods --------------
+    /**
+     * Computes target column indexes for partial updates. If {@code specifiedColumns} is null or
+     * empty, returns null indicating full update. Validates that all primary key columns are
+     * included in the specified columns.
+     *
+     * @param allFieldNames the list of all field names in table row type order
+     * @param primaryKeyNames the list of primary key column names
+     * @param specifiedColumns the optional list of columns specified for partial update
+     * @return the indexes into {@code allFieldNames} corresponding to {@code specifiedColumns}, or
+     *     null for full update
+     * @throws IllegalArgumentException if a specified column does not exist or primary key coverage
+     *     is incomplete
+     */
+    static int[] computeTargetColumnIndexes(
+            List<String> allFieldNames,
+            List<String> primaryKeyNames,
+            List<String> specifiedColumns) {
+        if (specifiedColumns == null || specifiedColumns.isEmpty()) {
+            return null; // full update
+        }
+
+        // Map specified column names to indexes
+        int[] indexes = new int[specifiedColumns.size()];
+        for (int i = 0; i < specifiedColumns.size(); i++) {
+            String col = specifiedColumns.get(i);
+            int idx = allFieldNames.indexOf(col);
+            checkArgument(
+                    idx >= 0, "Column '%s' not found in table schema: %s", col, allFieldNames);
+            indexes[i] = idx;
+        }
+
+        // Validate that all primary key columns are covered
+        for (String pk : primaryKeyNames) {
+            checkArgument(
+                    specifiedColumns.contains(pk),
+                    "Partial updates must include all primary key columns. Missing primary key column: %s. Provided columns: %s",
+                    pk,
+                    specifiedColumns);
+        }
+
+        return indexes;
     }
 }

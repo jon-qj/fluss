@@ -35,6 +35,9 @@ import org.apache.fluss.server.coordinator.LakeTableTieringManager;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.coordinator.TestCoordinatorChannelManager;
 import org.apache.fluss.server.coordinator.event.CoordinatorEventManager;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
+import org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElection.ControlledShutdownLeaderElection;
+import org.apache.fluss.server.coordinator.statemachine.TableBucketStateMachine.ElectionResult;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.zk.NOPErrorHandler;
@@ -43,6 +46,7 @@ import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.shaded.guava32.com.google.common.collect.Sets;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
+import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -66,7 +70,7 @@ import static org.apache.fluss.server.coordinator.statemachine.BucketState.NewBu
 import static org.apache.fluss.server.coordinator.statemachine.BucketState.NonExistentBucket;
 import static org.apache.fluss.server.coordinator.statemachine.BucketState.OfflineBucket;
 import static org.apache.fluss.server.coordinator.statemachine.BucketState.OnlineBucket;
-import static org.apache.fluss.server.coordinator.statemachine.ReplicaLeaderElectionStrategy.CONTROLLED_SHUTDOWN_ELECTION;
+import static org.apache.fluss.server.coordinator.statemachine.TableBucketStateMachine.initReplicaLeaderElection;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -84,6 +88,7 @@ class TableBucketStateMachineTest {
     private AutoPartitionManager autoPartitionManager;
     private LakeTableTieringManager lakeTableTieringManager;
     private CoordinatorMetadataCache serverMetadataCache;
+    private KvSnapshotLeaseManager kvSnapshotLeaseManager;
 
     @BeforeAll
     static void baseBeforeAll() {
@@ -97,7 +102,8 @@ class TableBucketStateMachineTest {
     void beforeEach() throws IOException {
         Configuration conf = new Configuration();
         conf.setString(ConfigOptions.COORDINATOR_HOST, "localhost");
-        conf.setString(ConfigOptions.REMOTE_DATA_DIR, "/tmp/fluss/remote-data");
+        String remoteDir = "/tmp/fluss/remote-data";
+        conf.setString(ConfigOptions.REMOTE_DATA_DIR, remoteDir);
         coordinatorContext = new CoordinatorContext();
         testCoordinatorChannelManager = new TestCoordinatorChannelManager();
         coordinatorRequestBatch =
@@ -117,6 +123,15 @@ class TableBucketStateMachineTest {
                                 new LakeCatalogDynamicLoader(new Configuration(), null, true)),
                         new Configuration());
         lakeTableTieringManager = new LakeTableTieringManager();
+
+        kvSnapshotLeaseManager =
+                new KvSnapshotLeaseManager(
+                        Duration.ofMinutes(10).toMillis(),
+                        zookeeperClient,
+                        remoteDir,
+                        SystemClock.getInstance(),
+                        TestingMetricGroups.COORDINATOR_METRICS);
+        kvSnapshotLeaseManager.start();
     }
 
     @Test
@@ -238,6 +253,9 @@ class TableBucketStateMachineTest {
         coordinatorContext.putBucketState(tableBucket, OfflineBucket);
         coordinatorContext.setLiveTabletServers(createServers(Collections.emptyList()));
         tableBucketStateMachine.handleStateChange(Collections.singleton(tableBucket), OnlineBucket);
+        coordinatorContext.setLiveTabletServers(
+                CoordinatorTestUtils.createServers(Collections.emptyList()));
+        tableBucketStateMachine.handleStateChange(Collections.singleton(tableBucket), OnlineBucket);
         // the state will still be offline
         assertThat(coordinatorContext.getBucketState(tableBucket)).isEqualTo(OfflineBucket);
 
@@ -263,7 +281,8 @@ class TableBucketStateMachineTest {
                         new MetadataManager(
                                 zookeeperClient,
                                 new Configuration(),
-                                new LakeCatalogDynamicLoader(new Configuration(), null, true)));
+                                new LakeCatalogDynamicLoader(new Configuration(), null, true)),
+                        kvSnapshotLeaseManager);
         CoordinatorEventManager eventManager =
                 new CoordinatorEventManager(
                         coordinatorEventProcessor, TestingMetricGroups.COORDINATOR_METRICS);
@@ -376,10 +395,24 @@ class TableBucketStateMachineTest {
 
         // handle state change for controlled shutdown.
         tableBucketStateMachine.handleStateChange(
-                Collections.singleton(tb), OnlineBucket, CONTROLLED_SHUTDOWN_ELECTION);
+                Collections.singleton(tb), OnlineBucket, new ControlledShutdownLeaderElection());
         assertThat(coordinatorContext.getBucketState(tb)).isEqualTo(OnlineBucket);
         assertThat(coordinatorContext.getBucketLeaderAndIsr(tb).get().leader())
                 .isNotEqualTo(oldLeader);
+    }
+
+    @Test
+    void testInitReplicaLeaderElection() {
+        List<Integer> assignments = Arrays.asList(2, 4);
+        List<Integer> liveReplicas = Collections.singletonList(4);
+
+        Optional<ElectionResult> leaderElectionResultOpt =
+                initReplicaLeaderElection(assignments, liveReplicas, 0);
+        assertThat(leaderElectionResultOpt.isPresent()).isTrue();
+        ElectionResult leaderElectionResult = leaderElectionResultOpt.get();
+        assertThat(leaderElectionResult.getLiveReplicas()).containsExactlyInAnyOrder(4);
+        assertThat(leaderElectionResult.getLeaderAndIsr().leader()).isEqualTo(4);
+        assertThat(leaderElectionResult.getLeaderAndIsr().isr()).containsExactlyInAnyOrder(4);
     }
 
     private TableBucketStateMachine createTableBucketStateMachine() {

@@ -101,7 +101,7 @@ public class ReplicaStateMachine {
     private Tuple2<Set<TableBucketReplica>, Set<TableBucketReplica>> initializeReplicaState() {
         Set<TableBucketReplica> onlineReplicas = new HashSet<>();
         Set<TableBucketReplica> offlineReplicas = new HashSet<>();
-        Set<TableBucket> allBuckets = coordinatorContext.allBuckets();
+        Set<TableBucket> allBuckets = coordinatorContext.getAllBuckets();
         for (TableBucket tableBucket : allBuckets) {
             List<Integer> replicas = coordinatorContext.getAssignment(tableBucket);
             for (Integer replica : replicas) {
@@ -221,8 +221,8 @@ public class ReplicaStateMachine {
                                 try {
                                     partitionName = getPartitionName(tableBucket);
                                 } catch (PartitionNotExistException e) {
-                                    LOG.error(e.getMessage());
-                                    logFailedSateChange(replica, currentState, targetState);
+                                    logFailedSateChange(
+                                            replica, currentState, targetState, e.getMessage());
                                     return;
                                 }
 
@@ -259,6 +259,7 @@ public class ReplicaStateMachine {
                                         Collections.singleton(replica.getReplica()),
                                         replica.getTableBucket(),
                                         false,
+                                        false,
                                         coordinatorContext.getBucketLeaderEpoch(
                                                 replica.getTableBucket())));
 
@@ -282,11 +283,11 @@ public class ReplicaStateMachine {
                         try {
                             partitionName = getPartitionName(tableBucket);
                         } catch (PartitionNotExistException e) {
-                            LOG.error(e.getMessage());
                             logFailedSateChange(
                                     tableBucketReplica,
                                     coordinatorContext.getReplicaState(tableBucketReplica),
-                                    targetState);
+                                    targetState,
+                                    e.getMessage());
                             continue;
                         }
                         // send leader request to the replica server
@@ -307,16 +308,35 @@ public class ReplicaStateMachine {
                         replica -> doStateChange(replica, ReplicaState.OfflineReplica));
 
                 break;
+            case ReplicaMigrationStarted:
+                validReplicas.forEach(
+                        replica -> doStateChange(replica, ReplicaState.ReplicaMigrationStarted));
+                validReplicas.forEach(
+                        tableBucketReplica -> {
+                            int replicaServer = tableBucketReplica.getReplica();
+                            // send stop replica request with deleteLocal = true and deleteRemote =
+                            // false indicates the replica is migrated.
+                            coordinatorRequestBatch.addStopReplicaRequestForTabletServers(
+                                    Collections.singleton(replicaServer),
+                                    tableBucketReplica.getTableBucket(),
+                                    true,
+                                    false,
+                                    coordinatorContext.getBucketLeaderEpoch(
+                                            tableBucketReplica.getTableBucket()));
+                        });
+                break;
             case ReplicaDeletionStarted:
                 validReplicas.forEach(
                         replica -> doStateChange(replica, ReplicaState.ReplicaDeletionStarted));
-                // send stop replica request with delete = true
+                // send stop replica request with deleteLocal = true and delete = true indicates the
+                // replica is deleted.
                 validReplicas.forEach(
                         tableBucketReplica -> {
                             int replicaServer = tableBucketReplica.getReplica();
                             coordinatorRequestBatch.addStopReplicaRequestForTabletServers(
                                     Collections.singleton(replicaServer),
                                     tableBucketReplica.getTableBucket(),
+                                    true,
                                     true,
                                     coordinatorContext.getBucketLeaderEpoch(
                                             tableBucketReplica.getTableBucket()));
@@ -343,7 +363,11 @@ public class ReplicaStateMachine {
                                 return true;
                             } else {
                                 logInvalidTransition(replica, curState, targetState);
-                                logFailedSateChange(replica, curState, targetState);
+                                logFailedSateChange(
+                                        replica,
+                                        curState,
+                                        targetState,
+                                        "Invalid Replica State Transition.");
                                 return false;
                             }
                         })
@@ -376,12 +400,16 @@ public class ReplicaStateMachine {
     }
 
     private void logFailedSateChange(
-            TableBucketReplica replica, ReplicaState currState, ReplicaState targetState) {
+            TableBucketReplica replica,
+            ReplicaState currState,
+            ReplicaState targetState,
+            String reason) {
         LOG.error(
-                "Fail to change state for table bucket replica {} from {} to {}.",
+                "Fail to change state for table bucket replica {} from {} to {}, reason: {}.",
                 stringifyReplica(replica),
                 currState,
-                targetState);
+                targetState,
+                reason);
     }
 
     private void logSuccessfulStateChange(

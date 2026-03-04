@@ -91,7 +91,7 @@ public class ZkNodeChangeNotificationWatcher {
             return;
         }
         running = false;
-        LOG.info("Stopping TableChangeWatcher");
+        LOG.info("Stopping ZkNodeChangeNotificationWatcher");
         curatorCache.close();
     }
 
@@ -139,8 +139,8 @@ public class ZkNodeChangeNotificationWatcher {
         for (String notification : sortedNotifications) {
             String notificationNode = seqNodeRoot + "/" + notification;
             try {
-                Optional<Stat> state = zooKeeperClient.getStat(notificationNode);
-                if (state.isPresent() && now - state.get().getCtime() >= changeExpirationMs) {
+                Stat state = zooKeeperClient.getStat(notificationNode).get();
+                if (now - state.getCtime() >= changeExpirationMs) {
                     LOG.debug("Purging change notification {}", notificationNode);
                     zooKeeperClient.deletePath(notificationNode);
                 }

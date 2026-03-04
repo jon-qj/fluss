@@ -23,14 +23,17 @@ import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.lake.LakeFlinkCatalog;
 import org.apache.fluss.flink.lake.LakeTableFactory;
 import org.apache.fluss.flink.sink.FlinkTableSink;
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
+import org.apache.fluss.flink.source.BinlogFlinkTableSource;
+import org.apache.fluss.flink.source.ChangelogFlinkTableSource;
 import org.apache.fluss.flink.source.FlinkTableSource;
+import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
-import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.TablePath;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.configuration.ConfigOption;
-import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.api.config.TableConfigOptions;
@@ -47,7 +50,6 @@ import org.apache.flink.table.factories.DynamicTableSourceFactory;
 import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.types.logical.RowType;
 
-import java.io.File;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -55,16 +57,15 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DELETE_BEHAVIOR;
 import static org.apache.fluss.config.FlussConfigUtils.CLIENT_PREFIX;
 import static org.apache.fluss.flink.catalog.FlinkCatalog.LAKE_TABLE_SPLITTER;
-import static org.apache.fluss.flink.utils.DataLakeUtils.getDatalakeFormat;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getBucketKeyIndexes;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getBucketKeys;
+import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.validateDistributionModeForMergeEngine;
 import static org.apache.fluss.flink.utils.FlinkConversions.toFlinkOption;
 
 /** Factory to create table source and table sink for Fluss. */
@@ -91,19 +92,25 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
             return lakeTableFactory.createDynamicTableSource(context, lakeTableName);
         }
 
+        // Check if this is a $changelog suffix in table name
+        if (tableName.endsWith(FlinkCatalog.CHANGELOG_TABLE_SUFFIX)) {
+            return createChangelogTableSource(context, tableIdentifier, tableName);
+        }
+
+        // Check if this is a $binlog suffix in table name
+        if (tableName.endsWith(FlinkCatalog.BINLOG_TABLE_SUFFIX)) {
+            return createBinlogTableSource(context, tableIdentifier, tableName);
+        }
+
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         final ReadableConfig tableOptions = helper.getOptions();
-        Optional<DataLakeFormat> datalakeFormat = getDatalakeFormat(tableOptions);
-        List<String> prefixesToSkip = new ArrayList<>(Arrays.asList("table.", "client."));
-        datalakeFormat.ifPresent(dataLakeFormat -> prefixesToSkip.add(dataLakeFormat + "."));
-        helper.validateExcept(prefixesToSkip.toArray(new String[0]));
+        validateSourceOptions(tableOptions);
 
         boolean isStreamingMode =
                 context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
                         == RuntimeExecutionMode.STREAMING;
 
         RowType tableOutputType = (RowType) context.getPhysicalRowDataType().getLogicalType();
-        FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions);
 
         ZoneId timeZone =
                 FlinkConnectorOptionsUtils.getLocalTimeZone(
@@ -138,6 +145,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                         .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
                         .toMillis();
 
+        LeaseContext leaseContext = LeaseContext.fromConf(tableOptions);
         return new FlinkTableSource(
                 toFlussTablePath(context.getObjectIdentifier()),
                 toFlussClientConfig(
@@ -148,25 +156,20 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 partitionKeyIndexes,
                 isStreamingMode,
                 startupOptions,
-                tableOptions.get(LookupOptions.MAX_RETRIES),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_ASYNC),
+                tableOptions.get(FlinkConnectorOptions.LOOKUP_INSERT_IF_NOT_EXISTS),
                 cache,
                 partitionDiscoveryIntervalMs,
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_DATALAKE_ENABLED)),
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_MERGE_ENGINE)),
-                context.getCatalogTable().getOptions());
+                context.getCatalogTable().getOptions(),
+                leaseContext);
     }
 
     @Override
     public DynamicTableSink createDynamicTableSink(Context context) {
         FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         final ReadableConfig tableOptions = helper.getOptions();
-        Optional<DataLakeFormat> datalakeFormat = getDatalakeFormat(tableOptions);
-        if (datalakeFormat.isPresent()) {
-            helper.validateExcept("table.", "client.", datalakeFormat.get() + ".");
-        } else {
-            helper.validateExcept("table.", "client.");
-        }
 
         boolean isStreamingMode =
                 context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
@@ -177,12 +180,24 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
 
         RowType rowType = (RowType) context.getPhysicalRowDataType().getLogicalType();
 
+        MergeEngineType mergeEngineType =
+                tableOptions.get(toFlinkOption(ConfigOptions.TABLE_MERGE_ENGINE));
+
+        // For primary key tables with any merge engine, keyed shuffle must be enabled
+        // to ensure correct data routing.
+        int[] primaryKeyIndexes = context.getPrimaryKeyIndexes();
+        DistributionMode distributionMode =
+                tableOptions.get(FlinkConnectorOptions.SINK_DISTRIBUTION_MODE);
+        if (primaryKeyIndexes.length > 0) {
+            validateDistributionModeForMergeEngine(mergeEngineType, distributionMode);
+        }
+
         return new FlinkTableSink(
                 toFlussTablePath(context.getObjectIdentifier()),
                 toFlussClientConfig(
                         context.getCatalogTable().getOptions(), context.getConfiguration()),
                 rowType,
-                context.getPrimaryKeyIndexes(),
+                primaryKeyIndexes,
                 partitionKeys,
                 isStreamingMode,
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_MERGE_ENGINE)),
@@ -191,7 +206,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(toFlinkOption(TABLE_DELETE_BEHAVIOR)),
                 tableOptions.get(FlinkConnectorOptions.BUCKET_NUMBER),
                 getBucketKeys(tableOptions),
-                tableOptions.get(FlinkConnectorOptions.SINK_BUCKET_SHUFFLE));
+                distributionMode,
+                tableOptions.getOptional(FlinkConnectorOptions.SINK_PRODUCER_ID).orElse(null));
     }
 
     @Override
@@ -209,14 +225,20 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         HashSet<ConfigOption<?>> options =
                 new HashSet<>(
                         Arrays.asList(
+                                FlinkConnectorOptions.AUTO_INCREMENT_FIELDS,
                                 FlinkConnectorOptions.BUCKET_KEY,
                                 FlinkConnectorOptions.BUCKET_NUMBER,
                                 FlinkConnectorOptions.SCAN_STARTUP_MODE,
                                 FlinkConnectorOptions.SCAN_STARTUP_TIMESTAMP,
                                 FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL,
+                                FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_ID,
+                                FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_DURATION,
                                 FlinkConnectorOptions.LOOKUP_ASYNC,
+                                FlinkConnectorOptions.LOOKUP_INSERT_IF_NOT_EXISTS,
                                 FlinkConnectorOptions.SINK_IGNORE_DELETE,
                                 FlinkConnectorOptions.SINK_BUCKET_SHUFFLE,
+                                FlinkConnectorOptions.SINK_DISTRIBUTION_MODE,
+                                FlinkConnectorOptions.SINK_PRODUCER_ID,
                                 LookupOptions.MAX_RETRIES,
                                 LookupOptions.CACHE_TYPE,
                                 LookupOptions.PARTIAL_CACHE_EXPIRE_AFTER_ACCESS,
@@ -244,10 +266,10 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                     }
                 });
 
-        // pass flink io tmp dir to fluss client.
-        flussConfig.setString(
-                ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR,
-                new File(flinkConfig.get(CoreOptions.TMP_DIRS), "/fluss").getAbsolutePath());
+        // Todo support LookupOptions.MAX_RETRIES. Currently, Fluss doesn't support connector level
+        // retry. The option 'client.lookup.max-retries' is only for dealing with the
+        // RetriableException return by server not all exceptions. Trace by:
+        // https://github.com/apache/fluss/issues/2099
         return flussConfig;
     }
 
@@ -264,5 +286,120 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
             }
         }
         return lakeTableFactory;
+    }
+
+    /**
+     * Validates table source options explicitly recognized by Flink.
+     *
+     * @param tableOptions the table options to validate
+     */
+    private static void validateSourceOptions(ReadableConfig tableOptions) {
+        FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions);
+    }
+
+    /** Creates a ChangelogFlinkTableSource for $changelog virtual tables. */
+    private DynamicTableSource createChangelogTableSource(
+            Context context, ObjectIdentifier tableIdentifier, String tableName) {
+        // Extract the base table name by removing the $changelog suffix
+        String baseTableName =
+                tableName.substring(
+                        0, tableName.length() - FlinkCatalog.CHANGELOG_TABLE_SUFFIX.length());
+
+        boolean isStreamingMode =
+                context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
+                        == RuntimeExecutionMode.STREAMING;
+
+        // tableOutputType includes metadata columns: [_change_type, _log_offset, _commit_timestamp,
+        // data_cols...]
+        RowType tableOutputType = (RowType) context.getPhysicalRowDataType().getLogicalType();
+
+        // Extract data columns type (skip the 3 metadata columns) for index calculations
+        int numMetadataColumns = 3;
+        List<RowType.RowField> dataFields =
+                tableOutputType
+                        .getFields()
+                        .subList(numMetadataColumns, tableOutputType.getFieldCount());
+        RowType dataColumnsType = new RowType(new ArrayList<>(dataFields));
+
+        Map<String, String> catalogTableOptions = context.getCatalogTable().getOptions();
+        FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
+        final ReadableConfig tableOptions = helper.getOptions();
+        validateSourceOptions(tableOptions);
+
+        ZoneId timeZone =
+                FlinkConnectorOptionsUtils.getLocalTimeZone(
+                        context.getConfiguration().get(TableConfigOptions.LOCAL_TIME_ZONE));
+        final FlinkConnectorOptionsUtils.StartupOptions startupOptions =
+                FlinkConnectorOptionsUtils.getStartupOptions(tableOptions, timeZone);
+
+        ResolvedCatalogTable resolvedCatalogTable = context.getCatalogTable();
+
+        // Partition key indexes based on data columns
+        int[] partitionKeyIndexes =
+                resolvedCatalogTable.getPartitionKeys().stream()
+                        .mapToInt(dataColumnsType::getFieldIndex)
+                        .toArray();
+
+        long partitionDiscoveryIntervalMs =
+                tableOptions
+                        .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
+                        .toMillis();
+
+        return new ChangelogFlinkTableSource(
+                TablePath.of(tableIdentifier.getDatabaseName(), baseTableName),
+                toFlussClientConfig(catalogTableOptions, context.getConfiguration()),
+                tableOutputType,
+                partitionKeyIndexes,
+                isStreamingMode,
+                startupOptions,
+                partitionDiscoveryIntervalMs,
+                catalogTableOptions);
+    }
+
+    /** Creates a BinlogFlinkTableSource for $binlog virtual tables. */
+    private DynamicTableSource createBinlogTableSource(
+            Context context, ObjectIdentifier tableIdentifier, String tableName) {
+        // Extract the base table name by removing the $binlog suffix
+        String baseTableName =
+                tableName.substring(
+                        0, tableName.length() - FlinkCatalog.BINLOG_TABLE_SUFFIX.length());
+
+        boolean isStreamingMode =
+                context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
+                        == RuntimeExecutionMode.STREAMING;
+
+        // tableOutputType: [_change_type, _log_offset, _commit_timestamp, before ROW<...>, after
+        // ROW<...>]
+        RowType tableOutputType = (RowType) context.getPhysicalRowDataType().getLogicalType();
+
+        Map<String, String> catalogTableOptions = context.getCatalogTable().getOptions();
+        FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
+        final ReadableConfig tableOptions = helper.getOptions();
+        validateSourceOptions(tableOptions);
+
+        ZoneId timeZone =
+                FlinkConnectorOptionsUtils.getLocalTimeZone(
+                        context.getConfiguration().get(TableConfigOptions.LOCAL_TIME_ZONE));
+        final FlinkConnectorOptionsUtils.StartupOptions startupOptions =
+                FlinkConnectorOptionsUtils.getStartupOptions(tableOptions, timeZone);
+
+        // Check if the table is partitioned from the internal option
+        boolean isPartitioned =
+                tableOptions.get(FlinkConnectorOptions.INTERNAL_BINLOG_IS_PARTITIONED);
+
+        long partitionDiscoveryIntervalMs =
+                tableOptions
+                        .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
+                        .toMillis();
+
+        return new BinlogFlinkTableSource(
+                TablePath.of(tableIdentifier.getDatabaseName(), baseTableName),
+                toFlussClientConfig(catalogTableOptions, context.getConfiguration()),
+                tableOutputType,
+                isPartitioned,
+                isStreamingMode,
+                startupOptions,
+                partitionDiscoveryIntervalMs,
+                catalogTableOptions);
     }
 }

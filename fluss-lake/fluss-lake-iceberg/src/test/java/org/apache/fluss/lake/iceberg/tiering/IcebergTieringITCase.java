@@ -54,7 +54,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
-import static org.apache.fluss.lake.committer.BucketOffset.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -173,7 +172,7 @@ class IcebergTieringITCase extends FlinkIcebergTieringTestBase {
                                 BinaryString.fromString("abc"),
                                 new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
         writeRows(t1, rows, false);
-        waitUntilSnapshot(t1Id, 1, 0);
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(t1);
 
         // then start tiering job
         JobClient jobClient = buildTieringJob(execEnv);
@@ -182,16 +181,7 @@ class IcebergTieringITCase extends FlinkIcebergTieringTestBase {
             assertReplicaStatus(t1Bucket, 3);
 
             checkDataInIcebergPrimaryKeyTable(t1, rows);
-            // check snapshot property in iceberg
-            Map<String, String> properties =
-                    new HashMap<String, String>() {
-                        {
-                            put(
-                                    FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY,
-                                    "[{\"bucket\":0,\"offset\":3}]");
-                        }
-                    };
-            checkSnapshotPropertyInIceberg(t1, properties);
+            checkFlussOffsetsInSnapshot(t1, Collections.singletonMap(t1Bucket, 3L));
 
             // test log table
             testLogTableTiering();
@@ -280,11 +270,11 @@ class IcebergTieringITCase extends FlinkIcebergTieringTestBase {
 
     private void checkDataInIcebergPrimaryKeyTable(
             TablePath tablePath, List<InternalRow> expectedRows) throws Exception {
-        Iterator<Record> acturalIterator = getIcebergRecords(tablePath).iterator();
+        Iterator<Record> actualIterator = getIcebergRecords(tablePath).iterator();
         Iterator<InternalRow> iterator = expectedRows.iterator();
-        while (iterator.hasNext() && acturalIterator.hasNext()) {
+        while (iterator.hasNext() && actualIterator.hasNext()) {
             InternalRow row = iterator.next();
-            Record record = acturalIterator.next();
+            Record record = actualIterator.next();
             assertThat(record.get(0)).isEqualTo(row.getBoolean(0));
             assertThat(record.get(1)).isEqualTo((int) row.getByte(1));
             assertThat(record.get(2)).isEqualTo((int) row.getShort(2));
@@ -317,7 +307,7 @@ class IcebergTieringITCase extends FlinkIcebergTieringTestBase {
             assertThat(record.get(17)).isEqualTo(row.getChar(17, 3).toString());
             assertThat(record.get(18)).isEqualTo(ByteBuffer.wrap(row.getBytes(18)));
         }
-        assertThat(acturalIterator.hasNext()).isFalse();
+        assertThat(actualIterator.hasNext()).isFalse();
         assertThat(iterator.hasNext()).isFalse();
     }
 
@@ -379,14 +369,17 @@ class IcebergTieringITCase extends FlinkIcebergTieringTestBase {
                         partitionedTablePath, partitionedTableDescriptor, partitionNameByIds);
         long tableId = tableIdAndDescriptor.f0;
 
+        Map<TableBucket, Long> expectedOffsets = new HashMap<>();
         // wait until synced to iceberg
         for (Long partitionId : partitionNameByIds.keySet()) {
             TableBucket tableBucket = new TableBucket(tableId, partitionId, 0);
             assertReplicaStatus(tableBucket, 3);
+            expectedOffsets.put(tableBucket, 3L);
         }
 
         // now, let's check data in iceberg per partition
         // check data in iceberg
+
         String partitionCol = partitionedTableDescriptor.getPartitionKeys().get(0);
         for (String partitionName : partitionNameByIds.values()) {
             checkDataInIcebergAppendOnlyPartitionedTable(
@@ -396,18 +389,6 @@ class IcebergTieringITCase extends FlinkIcebergTieringTestBase {
                     0);
         }
 
-        Map<String, String> properties =
-                new HashMap<String, String>() {
-                    {
-                        put(
-                                FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY,
-                                "["
-                                        + "{\"partition_id\":0,\"bucket\":0,\"partition_name\":\"date=2025\",\"offset\":3},"
-                                        + "{\"partition_id\":1,\"bucket\":0,\"partition_name\":\"date=2026\",\"offset\":3}"
-                                        + "]");
-                    }
-                };
-
-        checkSnapshotPropertyInIceberg(partitionedTablePath, properties);
+        checkFlussOffsetsInSnapshot(partitionedTablePath, expectedOffsets);
     }
 }

@@ -36,6 +36,12 @@ public interface LogScanner extends AutoCloseable {
     long EARLIEST_OFFSET = -2L;
 
     /**
+     * The latest offset to fetch to. Fluss uses this to indicate the default stopping offset for
+     * unbounded Fluss sources.
+     */
+    long NO_STOPPING_OFFSET = Long.MIN_VALUE;
+
+    /**
      * Poll log data from tablet server.
      *
      * <p>On each poll, scanner will try to use the last scanned offset as the starting offset and
@@ -99,6 +105,16 @@ public interface LogScanner extends AutoCloseable {
      * @throws java.lang.IllegalStateException if the table is a non-partitioned table.
      */
     void unsubscribe(long partitionId, int bucket);
+
+    /**
+     * Unsubscribe from the given bucket of a non-partitioned table dynamically.
+     *
+     * <p>Please use {@link #unsubscribe(long, int)} to unsubscribe a partitioned table.
+     *
+     * @param bucket the table bucket to unsubscribe.
+     * @throws java.lang.IllegalStateException if the table is a partitioned table.
+     */
+    void unsubscribe(int bucket);
 
     /**
      * Subscribe to the given partitioned table bucket from beginning dynamically. If the table

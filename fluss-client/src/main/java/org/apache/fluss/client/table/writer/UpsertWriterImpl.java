@@ -17,9 +17,9 @@
 
 package org.apache.fluss.client.table.writer;
 
+import org.apache.fluss.client.write.WriteFormat;
 import org.apache.fluss.client.write.WriteRecord;
 import org.apache.fluss.client.write.WriterClient;
-import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -30,6 +30,7 @@ import org.apache.fluss.row.compacted.CompactedRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.row.indexed.IndexedRow;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
@@ -40,9 +41,8 @@ import java.util.concurrent.CompletableFuture;
 
 /** The writer to write data to the primary key table. */
 class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
-    private static final UpsertResult UPSERT_SUCCESS = new UpsertResult();
-    private static final DeleteResult DELETE_SUCCESS = new DeleteResult();
 
+    private final TableInfo tableInfo;
     private final KeyEncoder primaryKeyEncoder;
     private final @Nullable int[] targetColumns;
 
@@ -50,37 +50,75 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
     private final KeyEncoder bucketKeyEncoder;
 
     private final KvFormat kvFormat;
+    private final WriteFormat writeFormat;
     private final RowEncoder rowEncoder;
     private final FieldGetter[] fieldGetters;
+
+    /** The merge mode for this writer. This controls how the server handles data merging. */
+    private final MergeMode mergeMode;
 
     UpsertWriterImpl(
             TablePath tablePath,
             TableInfo tableInfo,
             @Nullable int[] partialUpdateColumns,
             WriterClient writerClient) {
+        this(tablePath, tableInfo, partialUpdateColumns, writerClient, MergeMode.DEFAULT);
+    }
+
+    UpsertWriterImpl(
+            TablePath tablePath,
+            TableInfo tableInfo,
+            @Nullable int[] partialUpdateColumns,
+            WriterClient writerClient,
+            MergeMode mergeMode) {
         super(tablePath, tableInfo, writerClient);
         RowType rowType = tableInfo.getRowType();
-        sanityCheck(rowType, tableInfo.getPrimaryKeys(), partialUpdateColumns);
+        sanityCheck(
+                rowType,
+                tableInfo.getPrimaryKeys(),
+                tableInfo.getSchema().getAutoIncrementColumnNames(),
+                partialUpdateColumns);
 
         this.targetColumns = partialUpdateColumns;
-        DataLakeFormat lakeFormat = tableInfo.getTableConfig().getDataLakeFormat().orElse(null);
         // encode primary key using physical primary key
         this.primaryKeyEncoder =
-                KeyEncoder.of(rowType, tableInfo.getPhysicalPrimaryKeys(), lakeFormat);
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        tableInfo.getRowType(),
+                        tableInfo.getPhysicalPrimaryKeys(),
+                        tableInfo.getTableConfig(),
+                        tableInfo.isDefaultBucketKey());
         this.bucketKeyEncoder =
                 tableInfo.isDefaultBucketKey()
                         ? primaryKeyEncoder
-                        : KeyEncoder.of(rowType, tableInfo.getBucketKeys(), lakeFormat);
+                        : KeyEncoder.ofBucketKeyEncoder(
+                                tableInfo.getRowType(),
+                                tableInfo.getBucketKeys(),
+                                tableInfo.getTableConfig().getDataLakeFormat().orElse(null));
 
         this.kvFormat = tableInfo.getTableConfig().getKvFormat();
+        this.writeFormat = WriteFormat.fromKvFormat(this.kvFormat);
         this.rowEncoder = RowEncoder.create(kvFormat, rowType);
         this.fieldGetters = InternalRow.createFieldGetters(rowType);
+
+        this.tableInfo = tableInfo;
+        this.mergeMode = mergeMode;
     }
 
     private static void sanityCheck(
-            RowType rowType, List<String> primaryKeys, @Nullable int[] targetColumns) {
+            RowType rowType,
+            List<String> primaryKeys,
+            List<String> autoIncrementColumnNames,
+            @Nullable int[] targetColumns) {
         // skip check when target columns is null
         if (targetColumns == null) {
+            if (!autoIncrementColumnNames.isEmpty()) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "This table has auto increment column %s. "
+                                        + "Explicitly specifying values for an auto increment column is not allowed. "
+                                        + "Please specify non-auto-increment columns as target columns using partialUpdate first.",
+                                autoIncrementColumnNames));
+            }
             return;
         }
         BitSet targetColumnsSet = new BitSet();
@@ -101,10 +139,23 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             pkColumnSet.set(pkIndex);
         }
 
+        BitSet autoIncrementColumnSet = new BitSet();
+        // explicitly specifying values for an auto increment column is not allowed
+        for (String autoIncrementColumnName : autoIncrementColumnNames) {
+            int autoIncrementColumnIndex = rowType.getFieldIndex(autoIncrementColumnName);
+            if (targetColumnsSet.get(autoIncrementColumnIndex)) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Explicitly specifying values for the auto increment column %s is not allowed.",
+                                autoIncrementColumnName));
+            }
+            autoIncrementColumnSet.set(autoIncrementColumnIndex);
+        }
+
         // check the columns not in targetColumns should be nullable
         for (int i = 0; i < rowType.getFieldCount(); i++) {
-            // column not in primary key
-            if (!pkColumnSet.get(i)) {
+            // column not in primary key and not in auto increment column
+            if (!pkColumnSet.get(i) && !autoIncrementColumnSet.get(i)) {
                 // the column should be nullable
                 if (!rowType.getTypeAt(i).isNullable()) {
                     throw new IllegalArgumentException(
@@ -120,8 +171,9 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
      * Inserts row into Fluss table if they do not already exist, or updates them if they do exist.
      *
      * @param row the row to upsert.
-     * @return A {@link CompletableFuture} that always returns null when complete normally.
+     * @return A {@link CompletableFuture} that returns upsert result with bucket and offset info.
      */
+    @Override
     public CompletableFuture<UpsertResult> upsert(InternalRow row) {
         checkFieldCount(row);
         byte[] key = primaryKeyEncoder.encodeKey(row);
@@ -129,8 +181,15 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
                 bucketKeyEncoder == primaryKeyEncoder ? key : bucketKeyEncoder.encodeKey(row);
         WriteRecord record =
                 WriteRecord.forUpsert(
-                        getPhysicalPath(row), encodeRow(row), key, bucketKey, targetColumns);
-        return send(record).thenApply(ignored -> UPSERT_SUCCESS);
+                        tableInfo,
+                        getPhysicalPath(row),
+                        encodeRow(row),
+                        key,
+                        bucketKey,
+                        writeFormat,
+                        targetColumns,
+                        mergeMode);
+        return sendWithResult(record, UpsertResult::new);
     }
 
     /**
@@ -138,16 +197,24 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
      * key.
      *
      * @param row the row to delete.
-     * @return A {@link CompletableFuture} that always returns null when complete normally.
+     * @return A {@link CompletableFuture} that returns delete result with bucket and offset info.
      */
+    @Override
     public CompletableFuture<DeleteResult> delete(InternalRow row) {
         checkFieldCount(row);
         byte[] key = primaryKeyEncoder.encodeKey(row);
         byte[] bucketKey =
                 bucketKeyEncoder == primaryKeyEncoder ? key : bucketKeyEncoder.encodeKey(row);
         WriteRecord record =
-                WriteRecord.forDelete(getPhysicalPath(row), key, bucketKey, targetColumns);
-        return send(record).thenApply(ignored -> DELETE_SUCCESS);
+                WriteRecord.forDelete(
+                        tableInfo,
+                        getPhysicalPath(row),
+                        key,
+                        bucketKey,
+                        writeFormat,
+                        targetColumns,
+                        mergeMode);
+        return sendWithResult(record, DeleteResult::new);
     }
 
     private BinaryRow encodeRow(InternalRow row) {

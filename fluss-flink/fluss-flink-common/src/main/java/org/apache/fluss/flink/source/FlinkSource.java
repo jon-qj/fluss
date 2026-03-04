@@ -17,14 +17,15 @@
 
 package org.apache.fluss.flink.source;
 
+import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.source.deserializer.DeserializerInitContextImpl;
 import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
 import org.apache.fluss.flink.source.emitter.FlinkRecordEmitter;
 import org.apache.fluss.flink.source.enumerator.FlinkSourceEnumerator;
-import org.apache.fluss.flink.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.fluss.flink.source.metrics.FlinkSourceReaderMetrics;
 import org.apache.fluss.flink.source.reader.FlinkSourceReader;
+import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.source.reader.RecordAndPos;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.flink.source.split.SourceSplitSerializer;
@@ -50,6 +51,9 @@ import org.apache.flink.core.io.SimpleVersionedSerializer;
 
 import javax.annotation.Nullable;
 
+import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
+import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getClientScannerIoTmpDir;
+
 /** Flink source for Fluss. */
 public class FlinkSource<OUT>
         implements Source<OUT, SourceSplitBase, SourceEnumeratorState>, ResultTypeQueryable {
@@ -67,6 +71,7 @@ public class FlinkSource<OUT>
     private final FlussDeserializationSchema<OUT> deserializationSchema;
     @Nullable private final Predicate partitionFilters;
     @Nullable private final LakeSource<LakeSplit> lakeSource;
+    private final LeaseContext leaseContext;
 
     public FlinkSource(
             Configuration flussConf,
@@ -79,7 +84,8 @@ public class FlinkSource<OUT>
             long scanPartitionDiscoveryIntervalMs,
             FlussDeserializationSchema<OUT> deserializationSchema,
             boolean streaming,
-            @Nullable Predicate partitionFilters) {
+            @Nullable Predicate partitionFilters,
+            LeaseContext leaseContext) {
         this(
                 flussConf,
                 tablePath,
@@ -92,7 +98,8 @@ public class FlinkSource<OUT>
                 deserializationSchema,
                 streaming,
                 partitionFilters,
-                null);
+                null,
+                leaseContext);
     }
 
     public FlinkSource(
@@ -107,7 +114,8 @@ public class FlinkSource<OUT>
             FlussDeserializationSchema<OUT> deserializationSchema,
             boolean streaming,
             @Nullable Predicate partitionFilters,
-            @Nullable LakeSource<LakeSplit> lakeSource) {
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext) {
         this.flussConf = flussConf;
         this.tablePath = tablePath;
         this.hasPrimaryKey = hasPrimaryKey;
@@ -120,6 +128,7 @@ public class FlinkSource<OUT>
         this.streaming = streaming;
         this.partitionFilters = partitionFilters;
         this.lakeSource = lakeSource;
+        this.leaseContext = leaseContext;
     }
 
     @Override
@@ -140,7 +149,9 @@ public class FlinkSource<OUT>
                 scanPartitionDiscoveryIntervalMs,
                 streaming,
                 partitionFilters,
-                lakeSource);
+                lakeSource,
+                leaseContext,
+                false);
     }
 
     @Override
@@ -160,7 +171,11 @@ public class FlinkSource<OUT>
                 scanPartitionDiscoveryIntervalMs,
                 streaming,
                 partitionFilters,
-                lakeSource);
+                lakeSource,
+                new LeaseContext(
+                        sourceEnumeratorState.getLeaseId(),
+                        leaseContext.getKvSnapshotLeaseDurationMs()),
+                true);
     }
 
     @Override
@@ -181,6 +196,9 @@ public class FlinkSource<OUT>
         FlinkSourceReaderMetrics flinkSourceReaderMetrics =
                 new FlinkSourceReaderMetrics(context.metricGroup());
 
+        flussConf.set(
+                CLIENT_SCANNER_IO_TMP_DIR,
+                getClientScannerIoTmpDir(flussConf, context.getConfiguration()));
         deserializationSchema.open(
                 new DeserializerInitContextImpl(
                         context.metricGroup().addGroup("deserializer"),

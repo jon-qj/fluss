@@ -17,6 +17,9 @@
 
 package org.apache.fluss.flink.catalog;
 
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -24,7 +27,9 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 
@@ -35,6 +40,7 @@ import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.catalog.Catalog;
+import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
@@ -60,6 +66,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BUCKET_KEY;
@@ -115,7 +122,8 @@ abstract class FlinkCatalogITCase {
                         DEFAULT_DB,
                         bootstrapServers,
                         Thread.currentThread().getContextClassLoader(),
-                        Collections.emptyMap());
+                        Collections.emptyMap(),
+                        Collections::emptyMap);
         catalog.open();
     }
 
@@ -203,7 +211,7 @@ abstract class FlinkCatalogITCase {
     }
 
     @Test
-    void testAlterTable() throws Exception {
+    void testAlterTableConfig() throws Exception {
         String ddl =
                 "create table test_alter_table_append_only ("
                         + "a string, "
@@ -284,6 +292,32 @@ abstract class FlinkCatalogITCase {
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessage(
                         "Property 'paimon.file.format' is not supported to alter which is for datalake table.");
+
+        String unSupportedDml7 =
+                "alter table test_alter_table_append_only set ('auto-increment.fields' = 'b')";
+        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml7))
+                .rootCause()
+                .isInstanceOf(CatalogException.class)
+                .hasMessage("The option 'auto-increment.fields' is not supported to alter yet.");
+    }
+
+    @Test
+    void testAlterTableSchema() throws Exception {
+        ObjectPath objectPath = new ObjectPath(DEFAULT_DB, "append_only_table");
+        tEnv.executeSql(
+                        "create table append_only_table(a int, b STRING) with ('bucket.num' = '10')")
+                .await();
+        tEnv.executeSql("alter table append_only_table add c int").await();
+        CatalogTable table = (CatalogTable) catalog.getTable(objectPath);
+
+        Schema.Builder schemaBuilder = Schema.newBuilder();
+        Schema expectedSchema =
+                schemaBuilder
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .column("c", DataTypes.INT())
+                        .build();
+        assertThat(table.getUnresolvedSchema()).isEqualTo(expectedSchema);
     }
 
     @Test
@@ -565,7 +599,9 @@ abstract class FlinkCatalogITCase {
                         + "    cost AS price * quantity,\n"
                         + "    order_time TIMESTAMP(3),\n"
                         + "    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND\n"
-                        + ") with ('k1' = 'v1')");
+                        + ") with ('k1' = 'v1', 'bucket.num' = '2', "
+                        + "'table.datalake.format' = 'paimon', "
+                        + "'client.connect-timeout' = '120s')");
         CatalogTable table =
                 (CatalogTable) catalog.getTable(new ObjectPath(DEFAULT_DB, "expression_test"));
         Schema.Builder schemaBuilder = Schema.newBuilder();
@@ -585,9 +621,38 @@ abstract class FlinkCatalogITCase {
         Map<String, String> expectedOptions = new HashMap<>();
         expectedOptions.put("k1", "v1");
         expectedOptions.put(BUCKET_KEY.key(), "user");
-        expectedOptions.put(BUCKET_NUMBER.key(), "1");
+        expectedOptions.put(BUCKET_NUMBER.key(), "2");
         expectedOptions.put("table.datalake.format", "paimon");
+        expectedOptions.put("client.connect-timeout", "120s");
         assertOptionsEqual(table.getOptions(), expectedOptions);
+
+        // assert the stored table/custom configs
+        Configuration clientConfig = FLUSS_CLUSTER_EXTENSION.getClientConfig();
+        try (Connection conn = ConnectionFactory.createConnection(clientConfig)) {
+            Admin admin = conn.getAdmin();
+            TableInfo tableInfo =
+                    admin.getTableInfo(TablePath.of(DEFAULT_DB, "expression_test")).get();
+
+            Map<String, String> expectedTableProperties = new HashMap<>();
+            expectedTableProperties.put("table.datalake.format", "paimon");
+            expectedTableProperties.put("table.replication.factor", "1");
+            expectedTableProperties.put(
+                    "table.kv.format-version", String.valueOf(CURRENT_KV_FORMAT_VERSION));
+            assertThat(tableInfo.getProperties().toMap()).isEqualTo(expectedTableProperties);
+
+            Map<String, String> expectedCustomProperties = new HashMap<>();
+            expectedCustomProperties.put("k1", "v1");
+            expectedCustomProperties.put("client.connect-timeout", "120s");
+            expectedCustomProperties.put(
+                    "schema.watermark.0.strategy.expr", "`order_time` - INTERVAL '5' SECOND");
+            expectedCustomProperties.put("schema.watermark.0.rowtime", "order_time");
+            expectedCustomProperties.put("schema.watermark.0.strategy.data-type", "TIMESTAMP(3)");
+            expectedCustomProperties.put("schema.4.name", "cost");
+            expectedCustomProperties.put("schema.4.expr", "`price` * `quantity`");
+            expectedCustomProperties.put("schema.4.data-type", "DOUBLE");
+            expectedCustomProperties.put("bucket.num", "2");
+            assertThat(tableInfo.getCustomProperties().toMap()).isEqualTo(expectedCustomProperties);
+        }
     }
 
     @Test
@@ -696,20 +761,11 @@ abstract class FlinkCatalogITCase {
                 "create table test_table_other_unknown_options (a int, b int)"
                         + " with ('connector' = 'fluss', 'bootstrap.servers' = 'localhost:9092', 'other.unknown.option' = 'other-unknown-val')");
 
-        // test invalid table as source
-        assertThatThrownBy(() -> tEnv.explainSql("select * from test_table_other_unknown_options"))
-                .cause()
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("Unsupported options found for 'fluss'");
+        // test table with unknown option as source
+        tEnv.explainSql("select * from test_table_other_unknown_options");
 
-        // test invalid table as sink
-        assertThatThrownBy(
-                        () ->
-                                tEnv.explainSql(
-                                        "insert into test_table_other_unknown_options values (1, 2)"))
-                .cause()
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("Unsupported options found for 'fluss'");
+        // test table with unknown option as sink
+        tEnv.explainSql("insert into test_table_other_unknown_options values (1, 2)");
     }
 
     @Test
@@ -750,7 +806,8 @@ abstract class FlinkCatalogITCase {
                             DEFAULT_DB,
                             bootstrapServers,
                             Thread.currentThread().getContextClassLoader(),
-                            Collections.emptyMap());
+                            Collections.emptyMap(),
+                            Collections::emptyMap);
             Catalog finalAuthenticateCatalog = authenticateCatalog;
             assertThatThrownBy(finalAuthenticateCatalog::open)
                     .cause()
@@ -768,7 +825,8 @@ abstract class FlinkCatalogITCase {
                             DEFAULT_DB,
                             bootstrapServers,
                             Thread.currentThread().getContextClassLoader(),
-                            clientConfig);
+                            clientConfig,
+                            Collections::emptyMap);
             authenticateCatalog.open();
             assertThat(authenticateCatalog.listDatabases())
                     .containsExactlyInAnyOrderElementsOf(Collections.singletonList(DEFAULT_DB));
@@ -796,6 +854,137 @@ abstract class FlinkCatalogITCase {
                         "The configured default-database 'non-exist' does not exist in the Fluss cluster.");
     }
 
+    @Test
+    void testCreateCatalogWithLakeProperties() throws Exception {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("paimon.jdbc.password", "pass");
+        tEnv.executeSql(
+                String.format(
+                        "create catalog test_catalog_with_lake_properties with ('type' = 'fluss', '%s' = '%s', 'paimon.jdbc.password' = 'pass')",
+                        BOOTSTRAP_SERVERS.key(), FLUSS_CLUSTER_EXTENSION.getBootstrapServers()));
+        FlinkCatalog catalog =
+                (FlinkCatalog) tEnv.getCatalog("test_catalog_with_lake_properties").get();
+
+        assertOptionsEqual(catalog.getLakeCatalogProperties(), properties);
+
+        String ddl =
+                "create table test_get_lake_table ("
+                        + "a string, "
+                        + "b int) "
+                        + "with ('bucket.num' = '5', 'table.datalake.enabled' = 'true')";
+        tEnv.executeSql(ddl);
+
+        CatalogBaseTable catalogTable =
+                catalog.getTable(new ObjectPath(DEFAULT_DB, "test_get_lake_table"));
+        assertThat(catalogTable.getOptions())
+                .containsEntry("table.datalake.paimon.jdbc.password", "pass");
+    }
+
+    @Test
+    void testGetChangelogVirtualTable() throws Exception {
+        // Create a primary key table
+        tEnv.executeSql(
+                "CREATE TABLE pk_table_for_changelog ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id, name) NOT ENFORCED"
+                        + ") PARTITIONED BY (name) "
+                        + "WITH ('bucket.num' = '1')");
+
+        // Get the $changelog virtual table via catalog API
+        CatalogTable changelogTable =
+                (CatalogTable)
+                        catalog.getTable(
+                                new ObjectPath(DEFAULT_DB, "pk_table_for_changelog$changelog"));
+
+        // Build expected schema: metadata columns + original columns
+        Schema expectedSchema =
+                Schema.newBuilder()
+                        .column("_change_type", DataTypes.STRING().notNull())
+                        .column("_log_offset", DataTypes.BIGINT().notNull())
+                        .column("_commit_timestamp", DataTypes.TIMESTAMP_LTZ(3).notNull())
+                        .column("id", DataTypes.INT().notNull())
+                        .column("name", DataTypes.STRING().notNull())
+                        .column("amount", DataTypes.BIGINT())
+                        .build();
+
+        assertThat(changelogTable.getUnresolvedSchema()).isEqualTo(expectedSchema);
+        assertThat(changelogTable.getPartitionKeys()).isEqualTo(Collections.singletonList("name"));
+
+        // Verify options are inherited from base table
+        assertThat(changelogTable.getOptions()).containsEntry("bucket.num", "1");
+
+        // Verify $changelog log tables (append-only with insert change type)
+        tEnv.executeSql("CREATE TABLE log_table_for_changelog (id INT, name STRING)");
+
+        CatalogTable logChangelogTable =
+                (CatalogTable)
+                        catalog.getTable(
+                                new ObjectPath(DEFAULT_DB, "log_table_for_changelog$changelog"));
+
+        // Log table changelog should have same metadata columns
+        Schema expectedLogSchema =
+                Schema.newBuilder()
+                        .column("_change_type", DataTypes.STRING().notNull())
+                        .column("_log_offset", DataTypes.BIGINT().notNull())
+                        .column("_commit_timestamp", DataTypes.TIMESTAMP_LTZ(3).notNull())
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .build();
+
+        assertThat(logChangelogTable.getUnresolvedSchema()).isEqualTo(expectedLogSchema);
+    }
+
+    @Test
+    void testGetBinlogVirtualTable() throws Exception {
+        // Create a primary key table with partition
+        tEnv.executeSql(
+                "CREATE TABLE pk_table_for_binlog ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING NOT NULL,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id, name) NOT ENFORCED"
+                        + ") PARTITIONED BY (name) "
+                        + "WITH ('bucket.num' = '1')");
+
+        // Get the $binlog virtual table via catalog API
+        CatalogTable binlogTable =
+                (CatalogTable)
+                        catalog.getTable(new ObjectPath(DEFAULT_DB, "pk_table_for_binlog$binlog"));
+
+        // use string representation for assertion to simplify the unresolved schema comparison
+        assertThat(binlogTable.getUnresolvedSchema().toString())
+                .isEqualTo(
+                        "(\n"
+                                + "  `_change_type` STRING NOT NULL,\n"
+                                + "  `_log_offset` BIGINT NOT NULL,\n"
+                                + "  `_commit_timestamp` TIMESTAMP_LTZ(3) NOT NULL,\n"
+                                + "  `before` [ROW<id INT NOT NULL, name STRING NOT NULL, amount BIGINT>],\n"
+                                + "  `after` [ROW<id INT NOT NULL, name STRING NOT NULL, amount BIGINT>]\n"
+                                + ")");
+
+        // Binlog virtual tables have empty partition keys (columns are nested)
+        assertThat(binlogTable.getPartitionKeys()).isEmpty();
+
+        // Partition info is stored as an internal boolean flag
+        assertThat(binlogTable.getOptions())
+                .containsEntry(FlinkConnectorOptions.INTERNAL_BINLOG_IS_PARTITIONED.key(), "true");
+
+        // Verify options are inherited from base table
+        assertThat(binlogTable.getOptions()).containsEntry("bucket.num", "1");
+
+        // Verify $binlog is NOT supported for log tables (no primary key)
+        tEnv.executeSql("CREATE TABLE log_table_for_binlog (id INT, name STRING)");
+
+        assertThatThrownBy(
+                        () ->
+                                catalog.getTable(
+                                        new ObjectPath(DEFAULT_DB, "log_table_for_binlog$binlog")))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("only supported for primary key tables");
+    }
+
     /**
      * Before Flink 2.1, the {@link Schema} did not include an index field. Starting from Flink 2.1,
      * Flink introduced the concept of an index, and in Fluss, the primary key is considered as an
@@ -807,6 +996,7 @@ abstract class FlinkCatalogITCase {
             Map<String, String> actualOptions, Map<String, String> expectedOptions) {
         actualOptions.remove(ConfigOptions.BOOTSTRAP_SERVERS.key());
         actualOptions.remove(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
+        actualOptions.remove(ConfigOptions.TABLE_KV_FORMAT_VERSION.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);
     }
 }

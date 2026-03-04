@@ -97,6 +97,10 @@ public final class TestData {
                     currentMillis);
 
     // for log table / partition table
+    public static final TablePath PARTITION_TABLE_PATH =
+            new TablePath("test_db_1", "test_partition_table");
+    public static final long PARTITION_TABLE_ID = 150008L;
+
     public static final TableDescriptor DATA1_PARTITIONED_TABLE_DESCRIPTOR =
             TableDescriptor.builder()
                     .schema(DATA1_SCHEMA)
@@ -107,6 +111,16 @@ public final class TestData {
                             ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT,
                             AutoPartitionTimeUnit.YEAR)
                     .build();
+
+    public static final TableInfo PARTITION_TABLE_INFO =
+            TableInfo.of(
+                    PARTITION_TABLE_PATH,
+                    PARTITION_TABLE_ID,
+                    1,
+                    DATA1_PARTITIONED_TABLE_DESCRIPTOR,
+                    System.currentTimeMillis(),
+                    System.currentTimeMillis());
+
     public static final PhysicalTablePath DATA1_PHYSICAL_TABLE_PATH_PA_2024 =
             PhysicalTablePath.of(DATA1_TABLE_PATH, "2024");
 
@@ -216,5 +230,36 @@ public final class TestData {
                     .withComment("b is second column")
                     .primaryKey("a")
                     .build();
+
+    // DATA3 with auto-increment column for testing lookup-insert-if-not-exists
+    public static final RowType DATA3_ROW_TYPE =
+            DataTypes.ROW(
+                    new DataField("a", DataTypes.INT()),
+                    new DataField("b", DataTypes.STRING()),
+                    new DataField("c", DataTypes.BIGINT()));
+    public static final RowType DATA3_KEY_TYPE = DataTypes.ROW(new DataField("a", DataTypes.INT()));
+    public static final Schema DATA3_SCHEMA_PK_AUTO_INC =
+            Schema.newBuilder()
+                    .column("a", DataTypes.INT())
+                    .withComment("a is primary key column")
+                    .column("b", DataTypes.STRING())
+                    .withComment("b is regular column")
+                    .column("c", DataTypes.BIGINT())
+                    .withComment("c is auto-increment column")
+                    .primaryKey("a")
+                    .enableAutoIncrement("c")
+                    .build();
+    public static final TablePath DATA3_TABLE_PATH_PK_AUTO_INC =
+            TablePath.of("test_db_3", "test_pk_table_auto_inc");
+    public static final long DATA3_TABLE_ID_PK_AUTO_INC = 150004L;
+    public static final TableDescriptor DATA3_TABLE_DESCRIPTOR_PK_AUTO_INC =
+            TableDescriptor.builder()
+                    .schema(DATA3_SCHEMA_PK_AUTO_INC)
+                    .distributedBy(3, "a")
+                    .build();
+
     // ---------------------------- data3 table info end ------------------------------
+
+    public static final TestingSchemaGetter TEST_SCHEMA_GETTER =
+            new TestingSchemaGetter(DEFAULT_SCHEMA_ID, DATA2_SCHEMA);
 }

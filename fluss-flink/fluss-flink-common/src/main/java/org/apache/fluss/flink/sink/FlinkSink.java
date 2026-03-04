@@ -19,62 +19,87 @@ package org.apache.fluss.flink.sink;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.adapter.SinkAdapter;
 import org.apache.fluss.flink.sink.serializer.FlussSerializationSchema;
+import org.apache.fluss.flink.sink.shuffle.DataStatisticsOperatorFactory;
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
+import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecord;
+import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecordChannelComputer;
+import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecordTypeInformation;
+import org.apache.fluss.flink.sink.undo.ProducerOffsetReporter;
+import org.apache.fluss.flink.sink.undo.UndoRecoveryOperatorFactory;
 import org.apache.fluss.flink.sink.writer.AppendSinkWriter;
 import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
 import org.apache.fluss.flink.sink.writer.UpsertSinkWriter;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TablePath;
 
+import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.operators.MailboxExecutor;
-import org.apache.flink.api.connector.sink2.Sink;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.sink2.SinkWriter;
-import org.apache.flink.api.connector.sink2.WriterInitContext;
-import org.apache.flink.runtime.metrics.groups.InternalSinkWriterMetricGroup;
+import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.streaming.api.connector.sink2.SupportsPreWriteTopology;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSink;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
+import org.apache.flink.table.connector.sink.SinkV2Provider;
 import org.apache.flink.table.types.logical.RowType;
 
 import javax.annotation.Nullable;
 
-import java.io.IOException;
 import java.io.Serializable;
 import java.util.List;
 
 import static org.apache.fluss.flink.sink.FlinkStreamPartitioner.partition;
 import static org.apache.fluss.flink.utils.FlinkConversions.toFlussRowType;
 
-/** Flink sink for Fluss. */
-class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT> {
+/**
+ * Flink sink for Fluss.
+ *
+ * <p>State management for undo recovery is handled by {@code UndoRecoveryOperator} which is added
+ * as part of the pre-write topology by {@link UpsertSinkWriterBuilder}, so this sink does not
+ * implement StatefulSink or SupportsWriterState.
+ */
+class FlinkSink<InputT> extends SinkAdapter<InputT> {
 
     private static final long serialVersionUID = 1L;
 
-    private final SinkWriterBuilder<? extends FlinkSinkWriter, InputT> builder;
+    protected final SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder;
+    private final TablePath tablePath;
 
-    FlinkSink(SinkWriterBuilder<? extends FlinkSinkWriter, InputT> builder) {
+    FlinkSink(
+            SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
+            TablePath tablePath) {
         this.builder = builder;
+        this.tablePath = tablePath;
     }
 
-    @Deprecated
     @Override
-    public SinkWriter<InputT> createWriter(InitContext context) throws IOException {
-        FlinkSinkWriter<InputT> flinkSinkWriter =
-                builder.createWriter(context.getMailboxExecutor());
-        flinkSinkWriter.initialize(InternalSinkWriterMetricGroup.wrap(context.metricGroup()));
+    protected SinkWriter<InputT> createWriter(
+            MailboxExecutor mailboxExecutor, SinkWriterMetricGroup metricGroup) {
+        FlinkSinkWriter<InputT> flinkSinkWriter = builder.createWriter(mailboxExecutor);
+        flinkSinkWriter.initialize(metricGroup);
         return flinkSinkWriter;
     }
 
-    @Override
-    public SinkWriter<InputT> createWriter(WriterInitContext context) throws IOException {
-        FlinkSinkWriter<InputT> flinkSinkWriter =
-                builder.createWriter(context.getMailboxExecutor());
-        flinkSinkWriter.initialize(InternalSinkWriterMetricGroup.wrap(context.metricGroup()));
-        return flinkSinkWriter;
-    }
-
-    @Override
-    public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-        return builder.addPreWriteTopology(input);
+    /**
+     * {@link FlinkSink} serves as the SQL connector. Since we uses {@link DataStreamSinkProvider}
+     * (rather than {@link SinkV2Provider}), it does not automatically recognize or invoke the
+     * {@link SupportsPreWriteTopology} interface. Therefore, the pre-write topology must be added
+     * manually here.
+     *
+     * <p>In contrast, {@link FlussSink} is used directly as a DataStream connector, Flink's runtime
+     * explicitly checks for the {@link SupportsPreWriteTopology} interface and automatically
+     * incorporates the pre-write topology if present. To support this path, the {@link
+     * SupportsPreWriteTopology} implementation resides in {@link FlussSink}.
+     */
+    public DataStreamSink<InputT> apply(DataStream<InputT> input) {
+        DataStream<InputT> stream = builder.addPreWriteTopology(input);
+        return stream.sinkTo(this)
+                .name("Sink(" + tablePath + ")")
+                .setParallelism(stream.getParallelism());
     }
 
     @Internal
@@ -97,7 +122,7 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
         private final List<String> bucketKeys;
         private final List<String> partitionKeys;
         private final @Nullable DataLakeFormat lakeFormat;
-        private final boolean shuffleByBucketId;
+        private final DistributionMode distributionMode;
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
 
         public AppendSinkWriterBuilder(
@@ -108,7 +133,7 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
                 List<String> bucketKeys,
                 List<String> partitionKeys,
                 @Nullable DataLakeFormat lakeFormat,
-                boolean shuffleByBucketId,
+                DistributionMode distributionMode,
                 FlussSerializationSchema<InputT> flussSerializationSchema) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
@@ -117,7 +142,7 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
             this.bucketKeys = bucketKeys;
             this.partitionKeys = partitionKeys;
             this.lakeFormat = lakeFormat;
-            this.shuffleByBucketId = shuffleByBucketId;
+            this.distributionMode = distributionMode;
             this.flussSerializationSchema = flussSerializationSchema;
         }
 
@@ -133,21 +158,78 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
 
         @Override
         public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-            // For append only sink, we will do bucket shuffle only if bucket keys are not empty.
-            if (!bucketKeys.isEmpty() && shuffleByBucketId) {
-                return partition(
-                        input,
-                        new FlinkRowDataChannelComputer<>(
-                                toFlussRowType(tableRowType),
-                                bucketKeys,
-                                partitionKeys,
-                                lakeFormat,
-                                numBucket,
-                                flussSerializationSchema),
-                        input.getParallelism());
-            } else {
-                return input;
+            switch (distributionMode) {
+                case NONE:
+                    return input;
+                case AUTO:
+                    // if bucket keys are not empty, use BUCKET as default. Otherwise, use NONE.
+                    return bucketKeys.isEmpty() ? input : bucketShuffle(input);
+                case BUCKET:
+                    if (!bucketKeys.isEmpty()) {
+                        return bucketShuffle(input);
+                    }
+                    throw new UnsupportedOperationException(
+                            "BUCKET mode is only supported for log tables with bucket keys");
+                case PARTITION_DYNAMIC:
+                    if (partitionKeys.isEmpty()) {
+                        throw new UnsupportedOperationException(
+                                "PARTITION_DYNAMIC is only supported for partitioned tables");
+                    }
+
+                    TypeInformation<StatisticsOrRecord<InputT>> statisticsOrRecordTypeInformation =
+                            new StatisticsOrRecordTypeInformation<>(input.getType());
+                    SingleOutputStreamOperator<StatisticsOrRecord<InputT>> shuffleStream =
+                            input.transform(
+                                            "Collect Statistics",
+                                            statisticsOrRecordTypeInformation,
+                                            new DataStatisticsOperatorFactory<>(
+                                                    toFlussRowType(tableRowType),
+                                                    partitionKeys,
+                                                    flussSerializationSchema))
+                                    // Set the parallelism same as input operator to encourage
+                                    // chaining
+                                    .setParallelism(input.getParallelism());
+
+                    return partition(
+                                    shuffleStream,
+                                    new StatisticsOrRecordChannelComputer<>(
+                                            toFlussRowType(tableRowType),
+                                            bucketKeys,
+                                            partitionKeys,
+                                            numBucket,
+                                            lakeFormat,
+                                            flussSerializationSchema),
+                                    input.getParallelism())
+                            .flatMap(
+                                    (FlatMapFunction<StatisticsOrRecord<InputT>, InputT>)
+                                            (statisticsOrRecord, out) -> {
+                                                if (statisticsOrRecord.isRecord()) {
+                                                    out.collect(statisticsOrRecord.record());
+                                                }
+                                            })
+                            .name("Strip Statistics")
+                            .setParallelism(input.getParallelism())
+                            // we remove the slot sharing group here make all operators can be
+                            // co-located in the same TaskManager slot
+                            .returns(input.getType());
+
+                default:
+                    throw new UnsupportedOperationException(
+                            "Unsupported distribution mode: " + distributionMode);
             }
+        }
+
+        private DataStream<InputT> bucketShuffle(DataStream<InputT> input) {
+            return partition(
+                    input,
+                    new FlinkRowDataChannelComputer<>(
+                            toFlussRowType(tableRowType),
+                            bucketKeys,
+                            partitionKeys,
+                            lakeFormat,
+                            numBucket,
+                            flussSerializationSchema),
+                    input.getParallelism());
         }
     }
 
@@ -165,8 +247,22 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
         private final List<String> bucketKeys;
         private final List<String> partitionKeys;
         private final @Nullable DataLakeFormat lakeFormat;
-        private final boolean shuffleByBucketId;
+        private final DistributionMode distributionMode;
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
+        private final boolean enableUndoRecovery;
+        @Nullable private final String producerId;
+
+        /**
+         * Optional context for reporting offsets to the upstream UndoRecoveryOperator.
+         *
+         * <p>This is set internally by {@link #addPreWriteTopology} when UndoRecoveryOperator is
+         * added to the pipeline. The context is then passed to the UpsertSinkWriter during
+         * creation.
+         *
+         * <p>Note: This field is NOT transient because the ProducerOffsetReporterHolder is
+         * serializable and needs to survive job serialization to be passed to the TaskManager.
+         */
+        @Nullable private ProducerOffsetReporter offsetReporter;
 
         UpsertSinkWriterBuilder(
                 TablePath tablePath,
@@ -177,8 +273,10 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
                 List<String> bucketKeys,
                 List<String> partitionKeys,
                 @Nullable DataLakeFormat lakeFormat,
-                boolean shuffleByBucketId,
-                FlussSerializationSchema<InputT> flussSerializationSchema) {
+                DistributionMode distributionMode,
+                FlussSerializationSchema<InputT> flussSerializationSchema,
+                boolean enableUndoRecovery,
+                @Nullable String producerId) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
             this.tableRowType = tableRowType;
@@ -187,8 +285,10 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
             this.bucketKeys = bucketKeys;
             this.partitionKeys = partitionKeys;
             this.lakeFormat = lakeFormat;
-            this.shuffleByBucketId = shuffleByBucketId;
+            this.distributionMode = distributionMode;
             this.flussSerializationSchema = flussSerializationSchema;
+            this.enableUndoRecovery = enableUndoRecovery;
+            this.producerId = producerId;
         }
 
         @Override
@@ -199,23 +299,61 @@ class FlinkSink<InputT> implements Sink<InputT>, SupportsPreWriteTopology<InputT
                     tableRowType,
                     targetColumnIndexes,
                     mailboxExecutor,
-                    flussSerializationSchema);
+                    flussSerializationSchema,
+                    offsetReporter);
         }
 
         @Override
         public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-            return shuffleByBucketId
-                    ? partition(
-                            input,
-                            new FlinkRowDataChannelComputer<>(
-                                    toFlussRowType(tableRowType),
-                                    bucketKeys,
-                                    partitionKeys,
-                                    lakeFormat,
-                                    numBucket,
-                                    flussSerializationSchema),
-                            input.getParallelism())
-                    : input;
+            DataStream<InputT> stream;
+            switch (distributionMode) {
+                case NONE:
+                    stream = input;
+                    break;
+                case AUTO:
+                case BUCKET:
+                    stream =
+                            partition(
+                                    input,
+                                    new FlinkRowDataChannelComputer<>(
+                                            toFlussRowType(tableRowType),
+                                            bucketKeys,
+                                            partitionKeys,
+                                            lakeFormat,
+                                            numBucket,
+                                            flussSerializationSchema),
+                                    input.getParallelism());
+                    break;
+                default:
+                    throw new UnsupportedOperationException(
+                            String.format(
+                                    "Unsupported distribution mode: %s for primary key table",
+                                    distributionMode));
+            }
+
+            // Add UndoRecoveryOperator for aggregation tables
+            if (enableUndoRecovery) {
+                UndoRecoveryOperatorFactory<InputT> operatorFactory =
+                        new UndoRecoveryOperatorFactory<>(
+                                tablePath,
+                                flussConfig,
+                                toFlussRowType(tableRowType),
+                                targetColumnIndexes,
+                                numBucket,
+                                !partitionKeys.isEmpty(),
+                                producerId);
+
+                stream =
+                        stream.transform(
+                                        "UndoRecovery(" + tablePath + ")",
+                                        stream.getType(),
+                                        operatorFactory)
+                                .setParallelism(stream.getParallelism());
+
+                offsetReporter = operatorFactory.getProducerOffsetReporter();
+            }
+
+            return stream;
         }
     }
 }

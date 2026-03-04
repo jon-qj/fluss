@@ -24,6 +24,7 @@ import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
@@ -50,6 +51,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -66,6 +68,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertQueryResultExactOrder;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertResultsIgnoreOrder;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsWithTimeout;
 import static org.apache.fluss.flink.utils.FlinkTestBase.waitUntilPartitions;
@@ -95,7 +98,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     }
 
     @BeforeEach
-    void before() {
+    void before() throws Exception {
         // open a catalog so that we can get table from the catalog
         String bootstrapServers = FLUSS_CLUSTER_EXTENSION.getBootstrapServers();
         // create table environment
@@ -129,7 +132,7 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     }
 
     @AfterEach
-    void after() {
+    void after() throws Exception {
         tEnv.useDatabase(BUILTIN_DATABASE);
         tEnv.executeSql(String.format("drop database %s cascade", DEFAULT_DB));
     }
@@ -167,12 +170,57 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void testAppendLogWithBucketKey(boolean sinkBucketShuffle) throws Exception {
+    void testAppendLogDuringAddColumn(boolean compressed) throws Exception {
+        String compressedProperties =
+                compressed
+                        ? ",'table.log.format' = 'arrow', 'table.log.arrow.compression.type' = 'zstd'"
+                        : "";
+        tEnv.executeSql(
+                "create table sink_test (a int not null, b bigint, c string) with "
+                        + "('bucket.num' = '3'"
+                        + compressedProperties
+                        + ")");
+        tEnv.executeSql(
+                        "INSERT INTO sink_test "
+                                + "VALUES (1, 3501, 'Tim'), "
+                                + "(2, 3502, 'Fabian'), "
+                                + "(3, 3503, 'coco') ")
+                .await();
+
+        CloseableIterator<Row> rowIter = tEnv.executeSql("select * from sink_test").collect();
+        // add new column
+        tEnv.executeSql("alter table sink_test add add_column int").await();
+        tEnv.executeSql(
+                        "INSERT INTO sink_test "
+                                + "VALUES (4, 3504, 'jerry', 4), "
+                                + "(5, 3505, 'piggy', 5), "
+                                + "(6, 3506, 'stave', 6)")
+                .await();
+        List<String> expectedRows =
+                Arrays.asList(
+                        "+I[1, 3501, Tim]", "+I[2, 3502, Fabian]",
+                        "+I[3, 3503, coco]", "+I[4, 3504, jerry]",
+                        "+I[5, 3505, piggy]", "+I[6, 3506, stave]");
+        assertResultsIgnoreOrder(rowIter, expectedRows, true);
+
+        // read with new schema.
+        rowIter = tEnv.executeSql("select * from sink_test").collect();
+        expectedRows =
+                Arrays.asList(
+                        "+I[1, 3501, Tim, null]", "+I[2, 3502, Fabian, null]",
+                        "+I[3, 3503, coco, null]", "+I[4, 3504, jerry, 4]",
+                        "+I[5, 3505, piggy, 5]", "+I[6, 3506, stave, 6]");
+        assertResultsIgnoreOrder(rowIter, expectedRows, true);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DistributionMode.class)
+    void testAppendLogWithBucketKey(DistributionMode distributionMode) throws Exception {
         tEnv.executeSql(
                 String.format(
                         "create table sink_test (a int not null, b bigint, c string) "
-                                + "with ('bucket.num' = '3', 'bucket.key' = 'c', 'sink.bucket-shuffle'= '%s')",
-                        sinkBucketShuffle));
+                                + "with ('bucket.num' = '3', 'bucket.key' = 'c', 'sink.distribution-mode'= '%s')",
+                        distributionMode));
         String insertSql =
                 "INSERT INTO sink_test(a, b, c) "
                         + "VALUES (1, 3501, 'Tim'), "
@@ -186,12 +234,21 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         + "(10, 3510, 'coco'), "
                         + "(11, 3511, 'stave'), "
                         + "(12, 3512, 'Tim')";
+
+        if (distributionMode == DistributionMode.PARTITION_DYNAMIC) {
+            assertThatThrownBy(() -> tEnv.executeSql(insertSql))
+                    .hasMessageContaining(
+                            "PARTITION_DYNAMIC is only supported for partitioned tables");
+            return;
+        }
         String insertPlan = tEnv.explainSql(insertSql, ExplainDetail.JSON_EXECUTION_PLAN);
-        if (sinkBucketShuffle) {
-            assertThat(insertPlan).contains("\"ship_strategy\" : \"BUCKET_SHUFFLE\"");
+        if (distributionMode == DistributionMode.BUCKET) {
+            assertThat(insertPlan).contains("\"ship_strategy\" : \"BUCKET\"");
         } else {
             assertThat(insertPlan).contains("\"ship_strategy\" : \"FORWARD\"");
         }
+        // there shouldn't have REBALANCE shuffle strategy, this asserts operator parallelism
+        assertThat(insertPlan).doesNotContain("\"ship_strategy\" : \"REBALANCE\"");
         tEnv.executeSql(insertSql).await();
 
         CloseableIterator<Row> rowIter = tEnv.executeSql("select * from sink_test").collect();
@@ -216,15 +273,17 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
         assertThat(actual).containsExactlyInAnyOrderElementsOf(expectedRows);
 
         // check data with the same bucket key should be read in sequence.
-        for (List<String> expected : expectedGroups) {
-            if (expected.size() <= 1) {
-                continue;
-            }
-            int prevIndex = actual.indexOf(expected.get(0));
-            for (int i = 1; i < expected.size(); i++) {
-                int index = actual.indexOf(expected.get(i));
-                assertThat(index).isGreaterThan(prevIndex);
-                prevIndex = index;
+        if (distributionMode == DistributionMode.BUCKET) {
+            for (List<String> expected : expectedGroups) {
+                if (expected.size() <= 1) {
+                    continue;
+                }
+                int prevIndex = actual.indexOf(expected.get(0));
+                for (int i = 1; i < expected.size(); i++) {
+                    int index = actual.indexOf(expected.get(i));
+                    assertThat(index).isGreaterThan(prevIndex);
+                    prevIndex = index;
+                }
             }
         }
     }
@@ -306,13 +365,76 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void testPut(boolean sinkBucketShuffle) throws Exception {
+    @EnumSource(value = DistributionMode.class)
+    void testAppendLogPartitionTable(DistributionMode distributionMode) throws Exception {
+        tEnv.executeSql(
+                String.format(
+                        "create table sink_test (a int not null, b bigint, c string) "
+                                + " partitioned by (c) "
+                                + "with ('bucket.num' = '3', 'sink.distribution-mode'= '%s')",
+                        distributionMode));
+        String insertSql =
+                "INSERT INTO sink_test(a, b, c) "
+                        + "VALUES (1, 3501, 'Tim'), "
+                        + "(2, 3502, 'Fabian'), "
+                        + "(3, 3503, 'Tim'), "
+                        + "(4, 3504, 'jerry'), "
+                        + "(5, 3505, 'piggy'), "
+                        + "(7, 3507, 'Fabian'), "
+                        + "(8, 3508, 'stave'), "
+                        + "(9, 3509, 'Tim'), "
+                        + "(10, 3510, 'coco'), "
+                        + "(11, 3511, 'stave'), "
+                        + "(12, 3512, 'Tim')";
+
+        if (distributionMode == DistributionMode.BUCKET) {
+            assertThatThrownBy(() -> tEnv.explainSql(insertSql, ExplainDetail.JSON_EXECUTION_PLAN))
+                    .hasMessageContaining(
+                            "BUCKET mode is only supported for log tables with bucket keys");
+            return;
+        }
+
+        String insertPlan = tEnv.explainSql(insertSql, ExplainDetail.JSON_EXECUTION_PLAN);
+        if (distributionMode == DistributionMode.PARTITION_DYNAMIC) {
+            assertThat(insertPlan)
+                    .contains(String.format("\"ship_strategy\" : \"%s\"", distributionMode.name()));
+        } else {
+            assertThat(insertPlan).contains("\"ship_strategy\" : \"FORWARD\"");
+        }
+        assertThat(insertPlan).doesNotContain("\"ship_strategy\" : \"REBALANCE\"");
+
+        tEnv.executeSql(insertSql).await();
+
+        CloseableIterator<Row> rowIter = tEnv.executeSql("select * from sink_test").collect();
+        //noinspection ArraysAsListWithZeroOrOneArgument
+        List<List<String>> expectedGroups =
+                Arrays.asList(
+                        Arrays.asList(
+                                "+I[1, 3501, Tim]",
+                                "+I[3, 3503, Tim]",
+                                "+I[9, 3509, Tim]",
+                                "+I[12, 3512, Tim]"),
+                        Arrays.asList("+I[2, 3502, Fabian]", "+I[7, 3507, Fabian]"),
+                        Arrays.asList("+I[4, 3504, jerry]"),
+                        Arrays.asList("+I[5, 3505, piggy]"),
+                        Arrays.asList("+I[8, 3508, stave]", "+I[11, 3511, stave]"),
+                        Arrays.asList("+I[10, 3510, coco]"));
+
+        List<String> expectedRows =
+                expectedGroups.stream().flatMap(List::stream).collect(Collectors.toList());
+
+        List<String> actual = collectRowsWithTimeout(rowIter, expectedRows.size());
+        assertThat(actual).containsExactlyInAnyOrderElementsOf(expectedRows);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DistributionMode.class)
+    void testPut(DistributionMode distributionMode) throws Exception {
         tEnv.executeSql(
                 String.format(
                         "create table sink_test (a int not null primary key not enforced, b bigint, c string)"
-                                + " with('bucket.num' = '3', 'sink.bucket-shuffle'= '%s')",
-                        sinkBucketShuffle));
+                                + " with('bucket.num' = '3', 'sink.distribution-mode'= '%s')",
+                        distributionMode));
 
         String insertSql =
                 "INSERT INTO sink_test(a, b, c) "
@@ -322,12 +444,22 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         + "(4, 3504, 'jerry'), "
                         + "(5, 3505, 'piggy'), "
                         + "(6, 3506, 'stave')";
+        if (distributionMode == DistributionMode.PARTITION_DYNAMIC) {
+            assertThatThrownBy(() -> tEnv.explainSql(insertSql, ExplainDetail.JSON_EXECUTION_PLAN))
+                    .hasMessageContaining(
+                            "Unsupported distribution mode: PARTITION_DYNAMIC for primary key table");
+            return;
+        }
+
         String insertPlan = tEnv.explainSql(insertSql, ExplainDetail.JSON_EXECUTION_PLAN);
-        if (sinkBucketShuffle) {
-            assertThat(insertPlan).contains("\"ship_strategy\" : \"BUCKET_SHUFFLE\"");
-        } else {
+        if (distributionMode == DistributionMode.BUCKET) {
+            assertThat(insertPlan).contains("\"ship_strategy\" : \"BUCKET\"");
+        } else if (distributionMode == DistributionMode.AUTO
+                || distributionMode == DistributionMode.NONE) {
             assertThat(insertPlan).contains("\"ship_strategy\" : \"FORWARD\"");
         }
+        assertThat(insertPlan).doesNotContain("\"ship_strategy\" : \"REBALANCE\"");
+
         tEnv.executeSql(insertSql).await();
 
         CloseableIterator<Row> rowIter = tEnv.executeSql("select * from sink_test").collect();
@@ -353,6 +485,44 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         "+I[11, 501, Timmy]", "+I[12, 502, Fab]",
                         "+I[13, 503, cony]", "+I[14, 504, jemmy]",
                         "+I[15, 505, pig]", "+I[16, 506, stephen]");
+        assertResultsIgnoreOrder(rowIter, expectedRows, true);
+    }
+
+    @Test
+    void testPutDuringAddColumn() throws Exception {
+        tEnv.executeSql(
+                "create table sink_test (a int not null primary key not enforced, b bigint, c string)");
+        tEnv.executeSql(
+                        "INSERT INTO sink_test "
+                                + "VALUES (1, 3501, 'Tim'), "
+                                + "(2, 3502, 'Fabian'), "
+                                + "(3, 3503, 'coco') ")
+                .await();
+
+        CloseableIterator<Row> rowIter = tEnv.executeSql("select * from sink_test").collect();
+        // add new column
+        tEnv.executeSql("alter table sink_test add add_column int").await();
+        tEnv.executeSql(
+                        "INSERT INTO sink_test "
+                                + "VALUES (4, 3504, 'jerry', 4), "
+                                + "(5, 3505, 'piggy', 5), "
+                                + "(6, 3506, 'stave', 6)")
+                .await();
+        List<String> expectedRows =
+                Arrays.asList(
+                        "+I[1, 3501, Tim]", "+I[2, 3502, Fabian]",
+                        "+I[3, 3503, coco]", "+I[4, 3504, jerry]",
+                        "+I[5, 3505, piggy]", "+I[6, 3506, stave]");
+        // read with old schema
+        assertResultsIgnoreOrder(rowIter, expectedRows, true);
+
+        // read with new schema.
+        rowIter = tEnv.executeSql("select * from sink_test").collect();
+        expectedRows =
+                Arrays.asList(
+                        "+I[1, 3501, Tim, null]", "+I[2, 3502, Fabian, null]",
+                        "+I[3, 3503, coco, null]", "+I[4, 3504, jerry, 4]",
+                        "+I[5, 3505, piggy, 5]", "+I[6, 3506, stave, 6]");
         assertResultsIgnoreOrder(rowIter, expectedRows, true);
     }
 
@@ -408,13 +578,64 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     }
 
     @Test
+    void testPartialUpsertDuringAddColumn() throws Exception {
+        tEnv.executeSql(
+                "create table sink_test (a int not null primary key not enforced, b bigint, c string) with('bucket.num' = '3')");
+
+        // partial insert
+        tEnv.executeSql("INSERT INTO sink_test(a, b) VALUES (1, 111), (2, 222)").await();
+        tEnv.executeSql("INSERT INTO sink_test(c, a) VALUES ('c1', 1), ('c2', 2)").await();
+
+        CloseableIterator<Row> rowIter = tEnv.executeSql("select * from sink_test").collect();
+        // add new column
+        tEnv.executeSql("alter table sink_test add add_column string").await();
+        tEnv.executeSql(
+                        "INSERT INTO sink_test(add_column, a ) VALUES ('new_value', 1), ('new_value', 2)")
+                .await();
+
+        // read with old schema
+        List<String> expectedRows =
+                Arrays.asList(
+                        "+I[1, 111, null]",
+                        "+I[2, 222, null]",
+                        "-U[1, 111, null]",
+                        "+U[1, 111, c1]",
+                        "-U[2, 222, null]",
+                        "+U[2, 222, c2]",
+                        "-U[1, 111, c1]",
+                        "+U[1, 111, c1]",
+                        "-U[2, 222, c2]",
+                        "+U[2, 222, c2]");
+        assertResultsIgnoreOrder(rowIter, expectedRows, true);
+
+        // read with new schema
+        CloseableIterator<Row> newSchemaRowIter =
+                tEnv.executeSql(
+                                "select * from sink_test /*+ OPTIONS('scan.startup.mode' = 'earliest') */ ")
+                        .collect();
+        expectedRows =
+                Arrays.asList(
+                        "+I[1, 111, null, null]",
+                        "+I[2, 222, null, null]",
+                        "-U[1, 111, null, null]",
+                        "+U[1, 111, c1, null]",
+                        "-U[2, 222, null, null]",
+                        "+U[2, 222, c2, null]",
+                        "-U[1, 111, c1, null]",
+                        "+U[1, 111, c1, new_value]",
+                        "-U[2, 222, c2, null]",
+                        "+U[2, 222, c2, new_value]");
+        assertResultsIgnoreOrder(newSchemaRowIter, expectedRows, true);
+    }
+
+    @Test
     void testFirstRowMergeEngine() throws Exception {
         tEnv.executeSql(
                 "create table first_row_source (a int not null primary key not enforced,"
                         + " b string) with('table.merge-engine' = 'first_row')");
         tEnv.executeSql("create table log_sink (a int, b string)");
 
-        // insert the primary table with first_row merge engine into the a log table to verify that
+        // insert the primary table with first_row merge engine into the log table to verify that
         // the first_row merge engine only generates append-only stream
         JobClient insertJobClient =
                 tEnv.executeSql("insert into log_sink select * from first_row_source")
@@ -676,6 +897,20 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                         "-U[4, 3504, Seattle]",
                         "+U[4, 3504, New York]");
         assertResultsIgnoreOrder(changelogIter, expectedRows, true);
+
+        // test schema evolution.
+        tBatchEnv
+                .executeSql(String.format("alter table %s add new_added_column int", tableName))
+                .await();
+        tBatchEnv
+                .executeSql("UPDATE " + tableName + " SET new_added_column = 2 WHERE a = 4")
+                .await();
+        CloseableIterator<Row> row5 =
+                tBatchEnv
+                        .executeSql(String.format("select * from %s WHERE a = 4", tableName))
+                        .collect();
+        expected = Collections.singletonList("+I[4, 3504, New York, 2]");
+        assertResultsIgnoreOrder(row5, expected, true);
     }
 
     @Test
@@ -999,32 +1234,35 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     @Test
     void testVersionMergeEngineWithTypeTimestamp() throws Exception {
         tEnv.executeSql(
-                "create table merge_engine_with_version (a int not null primary key not enforced,"
-                        + " b string, ts TIMESTAMP(3)) with('table.merge-engine' = 'versioned',"
-                        + "'table.merge-engine.versioned.ver-column' = 'ts')");
-
+                        "create table merge_engine_with_version (a int not null primary key not enforced,"
+                                + " b string, ts TIMESTAMP(3)) with('table.merge-engine' = 'versioned',"
+                                + "'table.merge-engine.versioned.ver-column' = 'ts')")
+                .await();
         // insert once
         tEnv.executeSql(
                         "INSERT INTO merge_engine_with_version (a, b, ts) VALUES "
                                 + "(1, 'v1', TIMESTAMP '2024-12-27 12:00:00.123'), "
                                 + "(2, 'v2', TIMESTAMP '2024-12-27 12:00:00.123'), "
-                                + "(1, 'v11', TIMESTAMP '2024-12-27 11:59:59.123'), "
-                                + "(3, 'v3', TIMESTAMP '2024-12-27 12:00:00.123'),"
-                                + "(3, 'v33', TIMESTAMP '2024-12-27 12:00:00.123');")
+                                + "(3, 'v3', TIMESTAMP '2024-12-27 12:00:00.123');")
                 .await();
-
         CloseableIterator<Row> rowIter =
                 tEnv.executeSql("select * from merge_engine_with_version").collect();
-
-        // id=1 not update, but id=3 updated
         List<String> expectedRows =
                 Arrays.asList(
                         "+I[1, v1, 2024-12-27T12:00:00.123]",
                         "+I[2, v2, 2024-12-27T12:00:00.123]",
-                        "+I[3, v3, 2024-12-27T12:00:00.123]",
+                        "+I[3, v3, 2024-12-27T12:00:00.123]");
+        assertResultsIgnoreOrder(rowIter, expectedRows, false);
+
+        // insert again. id=1 not update, but id=3 updated
+        tEnv.executeSql(
+                "INSERT INTO merge_engine_with_version (a, b, ts) VALUES "
+                        + "(1, 'v11', TIMESTAMP '2024-12-27 11:59:59.123'), "
+                        + "(3, 'v33', TIMESTAMP '2024-12-27 12:00:00.123');");
+        expectedRows =
+                Arrays.asList(
                         "-U[3, v3, 2024-12-27T12:00:00.123]",
                         "+U[3, v33, 2024-12-27T12:00:00.123]");
-
         assertResultsIgnoreOrder(rowIter, expectedRows, true);
     }
 
@@ -1033,32 +1271,168 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
 
         tEnv.getConfig().set("table.local-time-zone", "UTC");
         tEnv.executeSql(
-                "create table merge_engine_with_version (a int not null primary key not enforced,"
-                        + " b string, ts TIMESTAMP(9) WITH LOCAL TIME ZONE ) with("
-                        + "'table.merge-engine' = 'versioned',"
-                        + "'table.merge-engine.versioned.ver-column' = 'ts')");
+                        "create table merge_engine_with_version (a int not null primary key not enforced,"
+                                + " b string, ts TIMESTAMP(9) WITH LOCAL TIME ZONE ) with("
+                                + "'table.merge-engine' = 'versioned',"
+                                + "'table.merge-engine.versioned.ver-column' = 'ts')")
+                .await();
 
         // insert once
         tEnv.executeSql(
                         "INSERT INTO merge_engine_with_version (a, b, ts) VALUES "
                                 + "(1, 'v1', CAST(TIMESTAMP '2024-12-27 12:00:00.123456789' AS TIMESTAMP(9) WITH LOCAL TIME ZONE)), "
                                 + "(2, 'v2', CAST(TIMESTAMP '2024-12-27 12:00:00.123456789' AS TIMESTAMP(9) WITH LOCAL TIME ZONE)), "
-                                + "(1, 'v11', CAST(TIMESTAMP '2024-12-27 12:00:00.123456788' AS TIMESTAMP(9) WITH LOCAL TIME ZONE)), "
-                                + "(3, 'v3', CAST(TIMESTAMP '2024-12-27 12:00:00.123456789' AS TIMESTAMP(9) WITH LOCAL TIME ZONE)), "
-                                + "(3, 'v33', CAST(TIMESTAMP '2024-12-27 12:00:00.123456789' AS TIMESTAMP(9) WITH LOCAL TIME ZONE));")
+                                + "(3, 'v3', CAST(TIMESTAMP '2024-12-27 12:00:00.123456789' AS TIMESTAMP(9) WITH LOCAL TIME ZONE));")
                 .await();
-
         CloseableIterator<Row> rowIter =
                 tEnv.executeSql("select * from merge_engine_with_version").collect();
-
-        // id=1 not update, but id=3 updated
         List<String> expectedRows =
                 Arrays.asList(
                         "+I[1, v1, 2024-12-27T12:00:00.123456789Z]",
                         "+I[2, v2, 2024-12-27T12:00:00.123456789Z]",
-                        "+I[3, v3, 2024-12-27T12:00:00.123456789Z]",
+                        "+I[3, v3, 2024-12-27T12:00:00.123456789Z]");
+        assertResultsIgnoreOrder(rowIter, expectedRows, false);
+
+        // insert again. id=1 not update, but id=3 updated
+        tEnv.executeSql(
+                        "INSERT INTO merge_engine_with_version (a, b, ts) VALUES "
+                                + "(1, 'v11', CAST(TIMESTAMP '2024-12-27 12:00:00.123456788' AS TIMESTAMP(9) WITH LOCAL TIME ZONE)), "
+                                + "(3, 'v33', CAST(TIMESTAMP '2024-12-27 12:00:00.123456789' AS TIMESTAMP(9) WITH LOCAL TIME ZONE));")
+                .await();
+        expectedRows =
+                Arrays.asList(
                         "-U[3, v3, 2024-12-27T12:00:00.123456789Z]",
                         "+U[3, v33, 2024-12-27T12:00:00.123456789Z]");
+
+        assertResultsIgnoreOrder(rowIter, expectedRows, true);
+    }
+
+    @Test
+    void testComprehensiveAggregationFunctions() throws Exception {
+        // Test all 11 aggregate functions (each function tested once with representative data type)
+        tEnv.executeSql(
+                "create table comprehensive_agg ("
+                        + "id int not null primary key not enforced, "
+                        // Numeric aggregations
+                        + "sum_int int, "
+                        + "sum_double double, "
+                        + "product_int int, "
+                        // Max/Min aggregations (representative types: int, double, string,
+                        // timestamp)
+                        + "max_int int, "
+                        + "max_timestamp timestamp(3), "
+                        + "min_double double, "
+                        + "min_string string, "
+                        // Value selection aggregations (test with/without nulls)
+                        + "first_val int, "
+                        + "first_val_non_null int, "
+                        + "last_val int, "
+                        + "last_val_non_null int, "
+                        // Boolean aggregations
+                        + "bool_and_val boolean, "
+                        + "bool_or_val boolean, "
+                        // String aggregation with custom delimiter
+                        + "listagg_val string"
+                        + ") with ("
+                        + "'table.merge-engine' = 'aggregation', "
+                        + "'fields.sum_int.agg' = 'sum', "
+                        + "'fields.sum_double.agg' = 'sum', "
+                        + "'fields.product_int.agg' = 'product', "
+                        + "'fields.max_int.agg' = 'max', "
+                        + "'fields.max_timestamp.agg' = 'max', "
+                        + "'fields.min_double.agg' = 'min', "
+                        + "'fields.min_string.agg' = 'min', "
+                        + "'fields.first_val.agg' = 'first_value', "
+                        + "'fields.first_val_non_null.agg' = 'first_value_ignore_nulls', "
+                        + "'fields.last_val.agg' = 'last_value', "
+                        + "'fields.last_val_non_null.agg' = 'last_value_ignore_nulls', "
+                        + "'fields.bool_and_val.agg' = 'bool_and', "
+                        + "'fields.bool_or_val.agg' = 'bool_or', "
+                        + "'fields.listagg_val.agg' = 'listagg', "
+                        + "'fields.listagg_val.listagg.delimiter' = '|')");
+
+        // Insert first batch - initial values
+        tEnv.executeSql(
+                        "INSERT INTO comprehensive_agg VALUES ("
+                                + "1, " // id
+                                + "1000, 10.5, " // sum_int, sum_double
+                                + "2, " // product_int
+                                + "100, TIMESTAMP '2024-01-15 15:00:00', " // max_int, max_timestamp
+                                + "100.0, 'beta', " // min_double, min_string
+                                + "100, 100, 100, 100, " // first_value, first_value_ignore_nulls,
+                                // last_value, last_value_ignore_nulls
+                                + "true, false, " // bool_and_val, bool_or_val
+                                + "'alpha'" // listagg_val
+                                + ")")
+                .await();
+
+        // Insert second batch - trigger aggregation
+        tEnv.executeSql(
+                        "INSERT INTO comprehensive_agg VALUES ("
+                                + "1, " // id
+                                + "2000, 20.5, " // sum: 1000+2000=3000, 10.5+20.5=31.0
+                                + "3, " // product: 2*3=6
+                                + "200, TIMESTAMP '2024-02-01 18:00:00', " // max: 200, 2024-02-01
+                                // 18:00
+                                + "50.0, 'alpha', " // min: 50.0, alpha
+                                + "200, 200, 200, 200, " // first: keep 100, first_ignore_nulls:
+                                // 200, last: 200, last_ignore_nulls: 200
+                                + "true, true, " // bool_and: true AND true=true, bool_or: false OR
+                                // true=true
+                                + "'beta'" // listagg: alpha|beta
+                                + ")")
+                .await();
+
+        // Insert third batch - further aggregation with null handling test
+        tEnv.executeSql(
+                        "INSERT INTO comprehensive_agg VALUES ("
+                                + "1, " // id
+                                + "3000, 30.5, " // sum: 3000+3000=6000, 31.0+30.5=61.5
+                                + "5, " // product: 6*5=30
+                                + "150, TIMESTAMP '2024-01-20 14:00:00', " // max: keep 200, keep
+                                // 2024-02-01 18:00
+                                + "80.0, 'charlie', " // min: keep 50.0, keep alpha
+                                + "300, CAST(NULL AS INT), 300, 300, " // first: keep 100, ignore
+                                // null keep 200, last: 300,
+                                // last_ignore_nulls: 300
+                                + "false, true, " // bool_and: true AND false=false, bool_or: true
+                                // OR true=true
+                                + "'gamma'" // listagg: alpha|beta|gamma
+                                + ")")
+                .await();
+
+        // Query and verify aggregated results
+        CloseableIterator<Row> rowIter =
+                tEnv.executeSql("SELECT * FROM comprehensive_agg").collect();
+
+        // Expected results: changelog with 5 records (+I, -U, +U, -U, +U)
+        List<String> expectedRows =
+                Arrays.asList(
+                        // First insert: initial values
+                        "+I[1, 1000, 10.5, 2, 100, 2024-01-15T15:00, 100.0, beta, 100, 100, 100, 100, true, false, alpha]",
+                        // Second insert: retraction
+                        "-U[1, 1000, 10.5, 2, 100, 2024-01-15T15:00, 100.0, beta, 100, 100, 100, 100, true, false, alpha]",
+                        // Second insert: aggregated result
+                        // sum: 1000+2000=3000, 10.5+20.5=31.0
+                        // product: 2*3=6
+                        // max: 200, 2024-02-01T18:00
+                        // min: 50.0, alpha
+                        // first: 100, first_non_null: 200, last: 200, last_non_null: 200
+                        // bool_and: true, bool_or: true
+                        // listagg: alpha|beta
+                        "+U[1, 3000, 31.0, 6, 200, 2024-02-01T18:00, 50.0, alpha, 100, 100, 200, 200, true, true, alpha|beta]",
+                        // Third insert: retraction
+                        "-U[1, 3000, 31.0, 6, 200, 2024-02-01T18:00, 50.0, alpha, 100, 100, 200, 200, true, true, alpha|beta]",
+                        // Third insert: final aggregated result
+                        // sum: 3000+3000=6000, 31.0+30.5=61.5
+                        // product: 6*5=30
+                        // max: 200 (unchanged), 2024-02-01T18:00 (unchanged)
+                        // min: 50.0 (unchanged), alpha (unchanged)
+                        // first: 100, first_ignore_nulls: 200 (null ignored), last: 300,
+                        // last_ignore_nulls: 300
+                        // bool_and: false, bool_or: true
+                        // listagg: alpha|beta|gamma
+                        "+U[1, 6000, 61.5, 30, 200, 2024-02-01T18:00, 50.0, alpha, 100, 100, 300, 300, false, true, alpha|beta|gamma]");
 
         assertResultsIgnoreOrder(rowIter, expectedRows, true);
     }
@@ -1222,5 +1596,228 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
             }
             assertResultsIgnoreOrder(rowIter, expectedRows, true);
         }
+    }
+
+    @Test
+    void testWalModeWithDefaultMergeEngineAndAggregation() throws Exception {
+        // use single parallelism to make result ordering stable
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+
+        String tableName = "wal_mode_pk_table";
+        // Create a table with WAL mode and default merge engine
+        tEnv.executeSql(
+                String.format(
+                        "create table %s ("
+                                + " id int not null,"
+                                + " category string,"
+                                + " amount bigint,"
+                                + " primary key (id) not enforced"
+                                + ") with ('table.changelog.image' = 'wal')",
+                        tableName));
+
+        // Insert initial data
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO %s VALUES "
+                                        + "(1, 'A', 100), "
+                                        + "(2, 'B', 200), "
+                                        + "(3, 'A', 150), "
+                                        + "(4, 'B', 250)",
+                                tableName))
+                .await();
+
+        // Use batch mode to update and delete records
+        tBatchEnv.executeSql("UPDATE " + tableName + " SET amount = 120 WHERE id = 1").await();
+        tBatchEnv.executeSql("UPDATE " + tableName + " SET amount = 180 WHERE id = 3").await();
+        tBatchEnv.executeSql("DELETE FROM " + tableName + " WHERE id = 4").await();
+
+        // Do aggregation on the table and verify ChangelogNormalize node is generated
+        String aggQuery =
+                String.format(
+                        "SELECT category, SUM(amount) as total_amount FROM %s /*+ OPTIONS('scan.startup.mode' = 'earliest') */ GROUP BY category",
+                        tableName);
+
+        // Explain the aggregation query to check for ChangelogNormalize
+        String aggPlan = tEnv.explainSql(aggQuery);
+        // ChangelogNormalize should be present to normalize the changelog for aggregation
+        // In Flink, when the source produces changelog with primary key semantics (I, UA, D),
+        // a ChangelogNormalize operator is inserted before aggregation
+        assertThat(aggPlan).contains("ChangelogNormalize");
+
+        // Expected aggregation results:
+        // Category A: 120 (id=1) + 180 (id=3) = 300
+        // Category B: 200 (id=2) = 200 (id=4 was deleted)
+        List<String> expectedAggResults =
+                Arrays.asList(
+                        "+I[A, 100]",
+                        "+I[B, 200]",
+                        "-U[A, 100]",
+                        "+U[A, 250]",
+                        "-U[B, 200]",
+                        "+U[B, 450]",
+                        "-U[A, 250]",
+                        "+U[A, 150]",
+                        "-U[A, 150]",
+                        "+U[A, 270]",
+                        "-U[A, 270]",
+                        "+U[A, 120]",
+                        "-U[A, 120]",
+                        "+U[A, 300]",
+                        "-U[B, 450]",
+                        "+U[B, 200]");
+
+        // Collect results with timeout
+        assertQueryResultExactOrder(tEnv, aggQuery, expectedAggResults);
+    }
+
+    @Test
+    void testAutoIncrementWithTargetColumns() throws Exception {
+        // use single parallelism to make result ordering stable
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+
+        String tableName = "auto_increment_pk_table";
+        // Create a table with auto increment column
+        tEnv.executeSql(
+                String.format(
+                        "create table %s ("
+                                + " id int not null,"
+                                + " auto_increment_id bigint,"
+                                + " amount bigint,"
+                                + " primary key (id) not enforced"
+                                + ") with ('auto-increment.fields'='auto_increment_id')",
+                        tableName));
+
+        // Insert initial data specifying only id and amount
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO %s (id, amount) VALUES "
+                                        + "(1, 100), "
+                                        + "(2, 200), "
+                                        + "(3, 150), "
+                                        + "(4, 250)",
+                                tableName))
+                .await();
+
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO %s (id, amount) VALUES " + "(3, 350), " + "(5, 500)",
+                                tableName))
+                .await();
+
+        List<String> expectedResults =
+                Arrays.asList(
+                        "+I[1, 1, 100]",
+                        "+I[2, 2, 200]",
+                        "+I[3, 3, 150]",
+                        "+I[4, 4, 250]",
+                        "-U[3, 3, 150]",
+                        "+U[3, 3, 350]",
+                        "+I[5, 5, 500]");
+
+        // Collect results with timeout
+        assertQueryResultExactOrder(
+                tEnv,
+                String.format(
+                        "SELECT id, auto_increment_id, amount FROM %s /*+ OPTIONS('scan.startup.mode' = 'earliest') */",
+                        tableName),
+                expectedResults);
+
+        // verify invalid target columns that include auto-increment column
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                                String.format(
+                                                        "INSERT INTO %s (id, auto_increment_id) VALUES "
+                                                                + "(6, 10)",
+                                                        tableName))
+                                        .await())
+                .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                .hasRootCauseMessage(
+                        "Explicitly specifying values for the auto increment column auto_increment_id is not allowed.");
+
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                                String.format(
+                                                        "INSERT INTO %s VALUES " + "(6, 10, 600)",
+                                                        tableName))
+                                        .await())
+                .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                .hasRootCauseMessage(
+                        "This table has auto increment column [auto_increment_id]. "
+                                + "Explicitly specifying values for an auto increment column is not allowed. "
+                                + "Please specify non-auto-increment columns as target columns using partialUpdate first.");
+
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                                String.format(
+                                                        "INSERT INTO %s (id, amount, auto_increment_id) VALUES "
+                                                                + "(6, 600, 10)",
+                                                        tableName))
+                                        .await())
+                .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                .hasRootCauseMessage(
+                        "This table has auto increment column [auto_increment_id]. "
+                                + "Explicitly specifying values for an auto increment column is not allowed. "
+                                + "Please specify non-auto-increment columns as target columns using partialUpdate first.");
+    }
+
+    @Test
+    void testWalModeWithAutoIncrement() throws Exception {
+        // use single parallelism to make result ordering stable
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+
+        String tableName = "wal_mode_pk_table";
+        // Create a table with WAL mode and auto increment column
+        tEnv.executeSql(
+                String.format(
+                        "create table %s ("
+                                + " id int not null,"
+                                + " auto_increment_id bigint,"
+                                + " amount bigint,"
+                                + " primary key (id) not enforced"
+                                + ") with ('table.changelog.image' = 'wal', 'auto-increment.fields'='auto_increment_id')",
+                        tableName));
+
+        // Insert initial data
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO %s (id, amount) VALUES "
+                                        + "(1, 100), "
+                                        + "(2, 200), "
+                                        + "(3, 150), "
+                                        + "(4, 250)",
+                                tableName))
+                .await();
+
+        // Use batch mode to update and delete records
+
+        // Upsert data, not support update/delete rows in table with auto-inc column for now.
+        // TODO: Support Batch Update
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO %s (id, amount) VALUES " + "(1, 120), " + "(3, 180)",
+                                tableName))
+                .await();
+
+        List<String> expectedResults =
+                Arrays.asList(
+                        "+I[insert, 1, 1, 100]",
+                        "+I[insert, 2, 2, 200]",
+                        "+I[insert, 3, 3, 150]",
+                        "+I[insert, 4, 4, 250]",
+                        "+I[update_after, 1, 1, 120]",
+                        "+I[update_after, 3, 3, 180]");
+
+        // Flink will generate ChangelogNormalize node to auto-complete the -U message,
+        // so we should read $changelog table to force read the raw underlying changelog
+        assertQueryResultExactOrder(
+                tEnv,
+                String.format(
+                        "SELECT _change_type, id, auto_increment_id, amount "
+                                + "FROM %s$changelog /*+ OPTIONS('scan.startup.mode' = 'earliest') */",
+                        tableName),
+                expectedResults);
     }
 }

@@ -20,6 +20,7 @@ package org.apache.fluss.config;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionType;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
@@ -27,10 +28,12 @@ import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.utils.ArrayUtils;
 
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -51,6 +54,9 @@ import static org.apache.fluss.config.ConfigOptions.NoKeyAssigner.STICKY;
 @PublicEvolving
 public class ConfigOptions {
     public static final String DEFAULT_LISTENER_NAME = "FLUSS";
+
+    public static final int KV_FORMAT_VERSION_2 = 2;
+    public static final int CURRENT_KV_FORMAT_VERSION = KV_FORMAT_VERSION_2;
 
     @Internal
     public static final String[] PARENT_FIRST_LOGGING_PATTERNS =
@@ -267,6 +273,17 @@ public class ConfigOptions {
     public static final ConfigOption<List<String>> SERVER_SASL_ENABLED_MECHANISMS_CONFIG =
             key("security.sasl.enabled.mechanisms").stringType().asList().noDefaultValue();
 
+    public static final ConfigOption<Integer> SERVER_IO_POOL_SIZE =
+            key("server.io-pool.size")
+                    .intType()
+                    .defaultValue(10)
+                    .withDescription(
+                            "The size of the IO thread pool to run blocking operations for both coordinator and tablet servers. "
+                                    + "This includes discard unnecessary snapshot files, transfer kv snapshot files, "
+                                    + "and transfer remote log files. Increase this value if you experience slow IO operations. "
+                                    + "The default value is 10.")
+                    .withDeprecatedKeys("coordinator.io-pool.size");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Coordinator Server
     // ------------------------------------------------------------------------
@@ -324,6 +341,11 @@ public class ConfigOptions {
                                     + " (“50100,50101”), ranges (“50100-50200”) or a combination of both."
                                     + "This option is deprecated. Please use bind.listeners instead, which provides a more flexible configuration for multiple ports");
 
+    /**
+     * @deprecated This option is deprecated. Please use {@link ConfigOptions#SERVER_IO_POOL_SIZE}
+     *     instead.
+     */
+    @Deprecated
     public static final ConfigOption<Integer> COORDINATOR_IO_POOL_SIZE =
             key("coordinator.io-pool.size")
                     .intType()
@@ -332,7 +354,30 @@ public class ConfigOptions {
                             "The size of the IO thread pool to run blocking operations for coordinator server. "
                                     + "This includes discard unnecessary snapshot files. "
                                     + "Increase this value if you experience slow unnecessary snapshot files clean. "
-                                    + "The default value is 10.");
+                                    + "The default value is 10. "
+                                    + "This option is deprecated. Please use server.io-pool.size instead.");
+
+    /**
+     * The TTL (time-to-live) for producer offsets. Producer offsets older than this TTL will be
+     * automatically cleaned up by the coordinator server.
+     */
+    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_OFFSETS_TTL =
+            key("coordinator.producer-offsets.ttl")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(24))
+                    .withDescription(
+                            "The TTL (time-to-live) for producer offsets. "
+                                    + "Producer offsets older than this TTL will be automatically cleaned up "
+                                    + "by the coordinator server. Default is 24 hours.");
+
+    /** The interval for cleaning up expired producer offsets and orphan files in remote storage. */
+    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_OFFSETS_CLEANUP_INTERVAL =
+            key("coordinator.producer-offsets.cleanup-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(1))
+                    .withDescription(
+                            "The interval for cleaning up expired producer offsets "
+                                    + "and orphan files in remote storage. Default is 1 hour.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Tablet Server
@@ -572,6 +617,16 @@ public class ConfigOptions {
                                     + "This allows each ZooKeeper client instance to load its own configuration file, "
                                     + "instead of relying on shared JVM-level environment settings. "
                                     + "This enables fine-grained control over ZooKeeper client behavior.");
+
+    public static final ConfigOption<Integer> ZOOKEEPER_MAX_BUFFER_SIZE =
+            key("zookeeper.client.max-buffer-size")
+                    .intType()
+                    .defaultValue(100 * 1024 * 1024) // 100MB
+                    .withDescription(
+                            "The maximum buffer size (in bytes) for ZooKeeper client. "
+                                    + "This corresponds to the jute.maxbuffer property. "
+                                    + "Default is 100MB to match the RPC frame length limit.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Log
     // ------------------------------------------------------------------------
@@ -759,13 +814,19 @@ public class ConfigOptions {
                             "Size of the thread pool used in scheduling tasks to copy segments, "
                                     + "fetch remote log indexes and clean up remote log segments.");
 
+    /**
+     * @deprecated This option is deprecated. Please use {@link ConfigOptions#SERVER_IO_POOL_SIZE}
+     *     instead.
+     */
+    @Deprecated
     public static final ConfigOption<Integer> REMOTE_LOG_DATA_TRANSFER_THREAD_NUM =
             key("remote.log.data-transfer-thread-num")
                     .intType()
                     .defaultValue(4)
                     .withDescription(
                             "The number of threads the server uses to transfer (download and upload) "
-                                    + "remote log file can be  data file, index file and remote log metadata file.");
+                                    + "remote log file can be  data file, index file and remote log metadata file. "
+                                    + "This option is deprecated. Please use server.io-pool.size instead.");
 
     // ------------------------------------------------------------------------
     //  Netty Settings
@@ -1112,6 +1173,14 @@ public class ConfigOptions {
                             "The maximum time to wait for the lookup batch to full, if this timeout is reached, "
                                     + "the lookup batch will be closed to send.");
 
+    public static final ConfigOption<Integer> CLIENT_LOOKUP_MAX_RETRIES =
+            key("client.lookup.max-retries")
+                    .intType()
+                    .defaultValue(Integer.MAX_VALUE)
+                    .withDescription(
+                            "Setting a value greater than zero will cause the client to resend any lookup request "
+                                    + "that fails with a potentially transient error.");
+
     public static final ConfigOption<Integer> CLIENT_SCANNER_REMOTE_LOG_PREFETCH_NUM =
             key("client.scanner.remote-log.prefetch-num")
                     .intType()
@@ -1212,7 +1281,7 @@ public class ConfigOptions {
                     .defaultValue(LogFormat.ARROW)
                     .withDescription(
                             "The format of the log records in log store. The default value is `arrow`. "
-                                    + "The supported formats are `arrow` and `indexed`.");
+                                    + "The supported formats are `arrow`, `indexed` and `compacted`.");
 
     public static final ConfigOption<ArrowCompressionType> TABLE_LOG_ARROW_COMPRESSION_TYPE =
             key("table.log.arrow.compression.type")
@@ -1238,6 +1307,27 @@ public class ConfigOptions {
                     .withDescription(
                             "The format of the kv records in kv store. The default value is `compacted`. "
                                     + "The supported formats are `compacted` and `indexed`.");
+
+    /** The version of the KV format. */
+    public static final ConfigOption<Integer> TABLE_KV_FORMAT_VERSION =
+            key("table.kv.format-version")
+                    .intType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The version of the kv format. "
+                                    + "Automatically set by the coordinator during table creation if not configured by users. "
+                                    + "Note: The datalake encoding and bucketing strategy mentioned below only takes effect "
+                                    + "when 'datalake.format' is configured at cluster level. "
+                                    + "Version Behaviors: "
+                                    + "(1) Version 1: Tables created before 'table.kv.format-version' was introduced are treated as version 1. "
+                                    + "Uses datalake's encoder (e.g., Paimon/Iceberg) for both primary key and bucket key encoding. "
+                                    + "This may not support prefix lookup properly because some datalake encoders (like Paimon) "
+                                    + "don't guarantee that encoded bucket key bytes are a prefix of encoded primary key bytes. "
+                                    + "(2) Version 2 (current): New tables use Fluss's default encoder for primary key encoding "
+                                    + "when bucket key differs from primary key, which ensures proper prefix lookup support. "
+                                    + "When bucket key equals primary key (default bucket key), it still uses datalake's encoder "
+                                    + "for optimization (encoded bytes can be reused for bucket calculation). "
+                                    + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation.");
 
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")
@@ -1363,15 +1453,23 @@ public class ConfigOptions {
                     .withDescription(
                             "If true, compaction will be triggered automatically when tiering service writes to the datalake. It is disabled by default.");
 
+    public static final ConfigOption<Boolean> TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT =
+            key("table.datalake.auto-expire-snapshot")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, snapshot expiration will be triggered automatically when tiering service commits to the datalake. It is disabled by default.");
+
     public static final ConfigOption<MergeEngineType> TABLE_MERGE_ENGINE =
             key("table.merge-engine")
                     .enumType(MergeEngineType.class)
                     .noDefaultValue()
                     .withDescription(
                             "Defines the merge engine for the primary key table. By default, primary key table doesn't have merge engine. "
-                                    + "The supported merge engines are `first_row` and `versioned`. "
+                                    + "The supported merge engines are `first_row`, `versioned`, and `aggregation`. "
                                     + "The `first_row` merge engine will keep the first row of the same primary key. "
-                                    + "The `versioned` merge engine will keep the row with the largest version of the same primary key.");
+                                    + "The `versioned` merge engine will keep the row with the largest version of the same primary key. "
+                                    + "The `aggregation` merge engine will aggregate rows with the same primary key using field-level aggregate functions.");
 
     public static final ConfigOption<String> TABLE_MERGE_ENGINE_VERSION_COLUMN =
             // we may need to introduce "del-column" in the future to support delete operation
@@ -1389,10 +1487,36 @@ public class ConfigOptions {
                     .withDescription(
                             "Defines the delete behavior for the primary key table. "
                                     + "The supported delete behaviors are `allow`, `ignore`, and `disable`. "
-                                    + "The `allow` behavior allows normal delete operations (default). "
+                                    + "The `allow` behavior allows normal delete operations (default for default merge engine). "
                                     + "The `ignore` behavior silently skips delete requests without error. "
                                     + "The `disable` behavior rejects delete requests with a clear error message. "
-                                    + "For tables with FIRST_ROW or VERSIONED merge engines, this option defaults to `ignore`.");
+                                    + "For tables with FIRST_ROW, VERSIONED, or AGGREGATION merge engines, this option defaults to `ignore`. "
+                                    + "Note: For AGGREGATION merge engine, when set to `allow`, delete operations will remove the entire record.");
+
+    public static final ConfigOption<Long> TABLE_AUTO_INCREMENT_CACHE_SIZE =
+            key("table.auto-increment.cache-size")
+                    .longType()
+                    .defaultValue(100000L)
+                    .withDescription(
+                            "The cache size of auto-increment IDs fetched from the distributed counter each time. "
+                                    + "This value determines the length of the locally cached ID segment. Default: 100000. "
+                                    + "A larger cache size may cause significant auto-increment ID gaps, especially when unused cached ID segments are discarded due to TabletServer restarts or abnormal terminations. "
+                                    + "Conversely, a smaller cache size increases the frequency of ID fetch requests to the distributed counter, introducing extra network overhead and reducing write throughput and performance.");
+
+    public static final ConfigOption<ChangelogImage> TABLE_CHANGELOG_IMAGE =
+            key("table.changelog.image")
+                    .enumType(ChangelogImage.class)
+                    .defaultValue(ChangelogImage.FULL)
+                    .withDescription(
+                            "Defines the changelog image mode for the primary key table. "
+                                    + "This configuration is inspired by similar settings in database systems like MySQL's binlog_row_image and PostgreSQL's replica identity. "
+                                    + "The supported modes are `FULL` (default) and `WAL`. "
+                                    + "The `FULL` mode produces both UPDATE_BEFORE and UPDATE_AFTER records for update operations, capturing complete information about updates and allowing tracking of previous values. "
+                                    + "The `WAL` mode does not produce UPDATE_BEFORE records. Only INSERT, UPDATE_AFTER (and DELETE if allowed) records are emitted. "
+                                    + "When WAL mode is enabled, the default merge engine is used (no merge engine configured), updates are full row updates (not partial update), and there is no auto-increment column, an optimization is applied to skip looking up old values, "
+                                    + "and in this case INSERT operations are converted to UPDATE_AFTER events. "
+                                    + "This mode reduces storage and transmission costs but loses the ability to track previous values. "
+                                    + "This option only affects primary key tables.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv
@@ -1412,18 +1536,32 @@ public class ConfigOptions {
                     .withDescription(
                             "The number of threads that the server uses to schedule snapshot kv data for all the replicas in the server.");
 
+    /**
+     * @deprecated This option is deprecated. Please use {@link ConfigOptions#SERVER_IO_POOL_SIZE}
+     *     instead.
+     */
+    @Deprecated
     public static final ConfigOption<Integer> KV_SNAPSHOT_TRANSFER_THREAD_NUM =
             key("kv.snapshot.transfer-thread-num")
                     .intType()
                     .defaultValue(4)
                     .withDescription(
-                            "The number of threads the server uses to transfer (download and upload) kv snapshot files.");
+                            "The number of threads the server uses to transfer (download and upload) kv snapshot files. "
+                                    + "This option is deprecated. Please use server.io-pool.size instead.");
 
     public static final ConfigOption<Integer> KV_MAX_RETAINED_SNAPSHOTS =
             key("kv.snapshot.num-retained")
                     .intType()
-                    .defaultValue(1)
+                    .defaultValue(2)
                     .withDescription("The maximum number of completed snapshots to retain.");
+
+    public static final ConfigOption<Duration> KV_SNAPSHOT_LEASE_EXPIRATION_CHECK_INTERVAL =
+            key("kv.snapshot.lease.expiration-check-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(10))
+                    .withDescription(
+                            "The interval to check the expiration of kv snapshot lease. "
+                                    + "The default setting is 10 minutes.");
 
     public static final ConfigOption<Integer> KV_MAX_BACKGROUND_THREADS =
             key("kv.rocksdb.thread.num")
@@ -1494,6 +1632,17 @@ public class ConfigOptions {
                     .withDescription(
                             "The max size of the consumed memory for RocksDB batch write, "
                                     + "will flush just based on item count if this config set to 0.");
+
+    public static final ConfigOption<MemorySize> KV_SHARED_RATE_LIMITER_BYTES_PER_SEC =
+            key("kv.rocksdb.shared-rate-limiter.bytes-per-sec")
+                    .memoryType()
+                    .defaultValue(new MemorySize(Long.MAX_VALUE))
+                    .withDescription(
+                            "The shared rate limit in bytes per second for RocksDB flush and compaction operations "
+                                    + "across all RocksDB instances in the TabletServer. "
+                                    + "All KV tablets share a single global RateLimiter to prevent disk IO from being saturated. "
+                                    + "The RateLimiter is always enabled. The default value is Long.MAX_VALUE (effectively unlimited). "
+                                    + "Set to a lower value (e.g., 100MB) to limit the rate.");
 
     // --------------------------------------------------------------------------
     // Provided configurable ColumnFamilyOptions within Fluss
@@ -1644,6 +1793,45 @@ public class ConfigOptions {
                             "If true, RocksDB will use block-based filter instead of full filter, this only take effect when bloom filter is used. "
                                     + "The default value is `false`.");
 
+    public static final ConfigOption<Boolean> KV_CACHE_INDEX_AND_FILTER_BLOCKS =
+            key("kv.rocksdb.block.cache-index-and-filter-blocks")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, index and filter blocks will be stored in block cache, "
+                                    + "together with all other data blocks. This helps to limit memory usage "
+                                    + "so that the total memory used by RocksDB is bounded by block cache size. "
+                                    + "The default value is `false`.");
+
+    public static final ConfigOption<Boolean> KV_CACHE_INDEX_AND_FILTER_BLOCKS_WITH_HIGH_PRIORITY =
+            key("kv.rocksdb.block.cache-index-and-filter-blocks-with-high-priority")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true and cache_index_and_filter_blocks is enabled, "
+                                    + "index and filter blocks will be stored with high priority in block cache, "
+                                    + "making them less likely to be evicted than data blocks. "
+                                    + "The default value is `false`.");
+
+    public static final ConfigOption<Boolean> KV_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE =
+            key("kv.rocksdb.block.pin-l0-filter-and-index-blocks-in-cache")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true and cache_index_and_filter_blocks is enabled, "
+                                    + "L0 index and filter blocks will be pinned in block cache and will not be evicted. "
+                                    + "This helps avoid performance degradation due to cache misses on L0 index/filter blocks. "
+                                    + "The default value is `false`.");
+
+    public static final ConfigOption<Boolean> KV_PIN_TOP_LEVEL_INDEX_AND_FILTER =
+            key("kv.rocksdb.block.pin-top-level-index-and-filter")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, the top-level index of partitioned index/filter blocks will be pinned "
+                                    + "in block cache and will not be evicted. "
+                                    + "The default value is `false`.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv recovering
     // ------------------------------------------------------------------------
@@ -1678,6 +1866,55 @@ public class ConfigOptions {
                                     + "like 9250-9260.");
 
     // ------------------------------------------------------------------------
+    //  ConfigOptions for prometheus push gateway reporter
+    // ------------------------------------------------------------------------
+    public static final ConfigOption<String> METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_HOST_URL =
+            key("metrics.reporter.prometheus-push.host-url")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The PushGateway server host URL including scheme, host name, and port.");
+
+    public static final ConfigOption<String> METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_JOB_NAME =
+            key("metrics.reporter.prometheus-push.job-name")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("The job name under which metrics will be pushed");
+
+    public static final ConfigOption<Boolean>
+            METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_RANDOM_JOB_NAME_SUFFIX =
+                    key("metrics.reporter.prometheus-push.random-job-name-suffix")
+                            .booleanType()
+                            .defaultValue(true)
+                            .withDescription(
+                                    "Specifies whether a random suffix should be appended to the job name. "
+                                            + "This is useful when multiple instances of the reporter "
+                                            + "are running on the same host.");
+
+    public static final ConfigOption<Boolean>
+            METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_DELETE_ON_SHUTDOWN =
+                    key("metrics.reporter.prometheus-push.delete-on-shutdown")
+                            .booleanType()
+                            .defaultValue(true)
+                            .withDescription(
+                                    "Specifies whether to delete metrics from the PushGateway on shutdown. Fluss will try its best to delete the metrics but this is not guaranteed.");
+
+    public static final ConfigOption<String> METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_GROUPING_KEY =
+            key("metrics.reporter.prometheus-push.grouping-key")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Specifies the grouping key which is the group and global labels of all metrics. The label name and value are separated by '=', and labels are separated by ';', e.g., k1=v1;k2=v2.");
+
+    public static final ConfigOption<Duration>
+            METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_PUSH_INTERVAL =
+                    key("metrics.reporter.prometheus-push.push-interval")
+                            .durationType()
+                            .defaultValue(Duration.ofSeconds(10))
+                            .withDescription(
+                                    "The interval of pushing metrics to Prometheus PushGateway.");
+
+    // ------------------------------------------------------------------------
     //  ConfigOptions for jmx reporter
     // ------------------------------------------------------------------------
     public static final ConfigOption<String> METRICS_REPORTER_JMX_HOST =
@@ -1702,6 +1939,20 @@ public class ConfigOptions {
                     .withDescription(
                             "The datalake format used by of Fluss to be as lakehouse storage. Currently, supported formats are Paimon, Iceberg, and Lance. "
                                     + "In the future, more kinds of data lake format will be supported, such as DeltaLake or Hudi.");
+
+    // ------------------------------------------------------------------------
+    //  ConfigOptions for tiering service
+    // ------------------------------------------------------------------------
+
+    public static final ConfigOption<Boolean> LAKE_TIERING_AUTO_EXPIRE_SNAPSHOT =
+            key("lake.tiering.auto-expire-snapshot")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, snapshot expiration will be triggered automatically when tiering service commits to the datalake, "
+                                    + "even if "
+                                    + ConfigOptions.TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT
+                                    + " is false.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for fluss kafka
@@ -1773,5 +2024,46 @@ public class ConfigOptions {
         SNAPPY,
         LZ4,
         ZSTD
+    }
+
+    // ------------------------------------------------------------------------
+    //  ConfigOptions Registry and Utilities
+    // ------------------------------------------------------------------------
+
+    /**
+     * Holder class for lazy initialization of ConfigOptions registry. This ensures that the
+     * registry is initialized only when first accessed, and guarantees that all ConfigOption fields
+     * are already initialized (since static initialization happens in declaration order).
+     */
+    private static class ConfigOptionsHolder {
+        private static final Map<String, ConfigOption<?>> CONFIG_OPTIONS_BY_KEY;
+
+        static {
+            Map<String, ConfigOption<?>> options = new HashMap<>();
+            Field[] fields = ConfigOptions.class.getFields();
+            for (Field field : fields) {
+                if (!ConfigOption.class.isAssignableFrom(field.getType())) {
+                    continue;
+                }
+                try {
+                    ConfigOption<?> configOption = (ConfigOption<?>) field.get(null);
+                    options.put(configOption.key(), configOption);
+                } catch (IllegalAccessException e) {
+                    // Ignore fields that cannot be accessed
+                }
+            }
+            CONFIG_OPTIONS_BY_KEY = Collections.unmodifiableMap(options);
+        }
+    }
+
+    /**
+     * Gets the ConfigOption for a given key.
+     *
+     * @param key the configuration key
+     * @return the ConfigOption if found, null otherwise
+     */
+    @Internal
+    public static ConfigOption<?> getConfigOption(String key) {
+        return ConfigOptionsHolder.CONFIG_OPTIONS_BY_KEY.get(key);
     }
 }

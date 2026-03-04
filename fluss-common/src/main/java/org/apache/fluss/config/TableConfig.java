@@ -19,6 +19,7 @@ package org.apache.fluss.config;
 
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionInfo;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
@@ -64,6 +65,15 @@ public class TableConfig {
         return config.get(ConfigOptions.TABLE_KV_FORMAT);
     }
 
+    /**
+     * Gets the kv format version of the table. This is used for backward compatibility when
+     * encoding strategy changes. Returns empty if the table was created before the version was
+     * introduced (old tables).
+     */
+    public Optional<Integer> getKvFormatVersion() {
+        return config.getOptional(ConfigOptions.TABLE_KV_FORMAT_VERSION);
+    }
+
     /** Gets the log TTL of the table. */
     public long getLogTTLMs() {
         return config.get(ConfigOptions.TABLE_LOG_TTL).toMillis();
@@ -100,6 +110,11 @@ public class TableConfig {
         return config.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION);
     }
 
+    /** Whether auto expire snapshot is enabled. */
+    public boolean isDataLakeAutoExpireSnapshot() {
+        return config.get(ConfigOptions.TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT);
+    }
+
     /** Gets the optional merge engine type of the table. */
     public Optional<MergeEngineType> getMergeEngineType() {
         return config.getOptional(ConfigOptions.TABLE_MERGE_ENGINE);
@@ -117,6 +132,14 @@ public class TableConfig {
         return config.getOptional(ConfigOptions.TABLE_DELETE_BEHAVIOR);
     }
 
+    /**
+     * Gets the changelog image mode of the table. The changelog image mode defines what information
+     * is included in the changelog for update operations.
+     */
+    public ChangelogImage getChangelogImage() {
+        return config.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
+    }
+
     /** Gets the Arrow compression type and compression level of the table. */
     public ArrowCompressionInfo getArrowCompressionInfo() {
         return ArrowCompressionInfo.fromConf(config);
@@ -125,5 +148,10 @@ public class TableConfig {
     /** Gets the auto partition strategy of the table. */
     public AutoPartitionStrategy getAutoPartitionStrategy() {
         return AutoPartitionStrategy.from(config);
+    }
+
+    /** Gets the number of auto-increment IDs cached per segment. */
+    public long getAutoIncrementCacheSize() {
+        return config.get(ConfigOptions.TABLE_AUTO_INCREMENT_CACHE_SIZE);
     }
 }

@@ -20,26 +20,28 @@ Fluss supports Apache Flink's Table API and Flink's DataStream API.
 
 For Flink's Table API, Fluss supports the following features:
 
-| Feature Support                                   | Flink | Notes                                  |
-|---------------------------------------------------|-------|----------------------------------------|
-| [SQL Create Catalog](ddl.md#create-catalog)       | ✔️    |                                        |
-| [SQL Create Database](ddl.md#create-database)     | ✔️    |                                        |
-| [SQL Drop Database](ddl.md#drop-database)         | ✔️    |                                        |
-| [SQL Create Table](ddl.md#create-table)           | ✔️    |                                        |
-| [SQL Create Table Like](ddl.md#create-table-like) | ✔️    |                                        |
-| [SQL Drop Table](ddl.md#drop-table)               | ✔️    |                                        |
-| [SQL Create Materialized Table](ddl.md#materialized-table) | ✔️    | Continuous refresh mode only |
-| [SQL Alter Materialized Table](ddl.md#alter-materialized-table) | ✔️    | Suspend/Resume support |
-| [SQL Drop Materialized Table](ddl.md#drop-materialized-table) | ✔️    |                                        |
-| [SQL Show Partitions](ddl.md#show-partitions)     | ✔️    |                                        |
-| [SQL Add Partition](ddl.md#add-partition)         | ✔️    |                                        |
-| [SQL Drop Partition](ddl.md#drop-partition)       | ✔️    |                                        |
-| [SQL Select](reads.md)                            | ✔️    | Support both streaming and batch mode. |
-| [SQL Limit](reads.md#limit-read)                  | ✔️    | Only for Log Table                     |
-| [SQL Insert Into](writes.md)                      | ✔️    | Support both streaming and batch mode. |
-| [SQL Delete From](writes.md#delete-from)          | ✔️    | Only in batch mode.                    |
-| [SQL Update](writes.md#update)                    | ✔️    | Only in batch mode.                    |
-| [SQL Lookup Join](lookups.md)                     | ✔️    |                                        |
+| Feature Support                                                 | Flink | Notes                                    |
+|-----------------------------------------------------------------|-------|------------------------------------------|
+| [SQL Create Catalog](ddl.md#create-catalog)                     | ✔️    |                                          |
+| [SQL Create Database](ddl.md#create-database)                   | ✔️    |                                          |
+| [SQL Drop Database](ddl.md#drop-database)                       | ✔️    |                                          |
+| [SQL Create Table](ddl.md#create-table)                         | ✔️    |                                          |
+| [SQL Create Table Like](ddl.md#create-table-like)               | ✔️    |                                          |
+| [SQL Drop Table](ddl.md#drop-table)                             | ✔️    |                                          |
+| [SQL Alter Table](ddl.md#alter-table)                           | ✔️    | SET/RESET properties                     |
+| [SQL Create Materialized Table](ddl.md#materialized-table)      | ✔️    | Continuous refresh mode only             |
+| [SQL Alter Materialized Table](ddl.md#alter-materialized-table) | ✔️    | Suspend/Resume support                   |
+| [SQL Drop Materialized Table](ddl.md#drop-materialized-table)   | ✔️    |                                          |
+| [SQL Show Partitions](ddl.md#show-partitions)                   | ✔️    |                                          |
+| [SQL Add Partition](ddl.md#add-partition)                       | ✔️    |                                          |
+| [SQL Drop Partition](ddl.md#drop-partition)                     | ✔️    |                                          |
+| [Procedures](ddl.md#procedures)                                 | ✔️    | ACL management and cluster configuration |
+| [SQL Select](reads.md)                                          | ✔️    | Support both streaming and batch mode.   |
+| [SQL Limit](reads.md#limit-read)                                | ✔️    | Only for Log Table                       |
+| [SQL Insert Into](writes.md)                                    | ✔️    | Support both streaming and batch mode.   |
+| [SQL Delete From](writes.md#delete-from)                        | ✔️    | Only in batch mode.                      |
+| [SQL Update](writes.md#update)                                  | ✔️    | Only in batch mode.                      |
+| [SQL Lookup Join](lookups.md)                                   | ✔️    |                                          |
 
 For Flink's DataStream API, you can see [DataStream API](docs/engine-flink/datastream.mdx) for more details.
 
@@ -49,14 +51,14 @@ For Flink's DataStream API, you can see [DataStream API](docs/engine-flink/datas
 Flink runs on all UNIX-like environments, i.e., Linux, Mac OS X, and Cygwin (for Windows).
 If you haven’t downloaded Flink, you can download [the binary release](https://flink.apache.org/downloads.html) of Flink, then extract the archive with the following command.
 ```shell
-tar -xzf flink-1.20.1-bin-scala_2.12.tgz
+tar -xzf flink-1.20.3-bin-scala_2.12.tgz
 ```
 - **Copy Fluss Flink Bundled Jar**
 
 Download [Fluss Flink Bundled jar](/downloads) and copy to the `lib` directory of your Flink home.
 
 ```shell
-cp fluss-flink-$FLUSS_VERSION$.jar <FLINK_HOME>/lib/
+cp fluss-flink-1.20-$FLUSS_VERSION$.jar <FLINK_HOME>/lib/
 ```
 :::note
 If you use [Amazon S3](http://aws.amazon.com/s3/), [Aliyun OSS](https://www.aliyun.com/product/oss) or [HDFS(Hadoop Distributed File System)](https://hadoop.apache.org/docs/stable/) as Fluss's [remote storage](maintenance/tiered-storage/remote-storage.md),
@@ -75,9 +77,15 @@ ps aux | grep flink
 ```
 - **Start a SQL Client**
 
-To quickly stop the cluster and all running components, you can use the provided script:
+To quickly start the SQL client, you can use the provided script:
 ```shell
 <FLINK_HOME>/bin/sql-client.sh
+```
+- **Stop the cluster**
+
+To quickly stop the cluster and all running components, you can use the provided script:
+```shell
+<FLINK_HOME>/bin/stop-cluster.sh
 ```
 
 
@@ -195,6 +203,9 @@ Fluss's integration for Flink automatically converts between Flink and Fluss typ
 | TIMESTAMP     | TIMESTAMP     |
 | TIMESTAMP_LTZ | TIMESTAMP_LTZ |
 | BYTES         | BYTES         |
+| ARRAY         | ARRAY         |
+| MAP           | MAP           |
+| ROW           | ROW           |
 
 ### Apache Flink -> Fluss
 
@@ -214,11 +225,11 @@ Fluss's integration for Flink automatically converts between Flink and Fluss typ
 | TIMESTAMP     | TIMESTAMP                                     |
 | TIMESTAMP_LTZ | TIMESTAMP_LTZ                                 |
 | BYTES         | BYTES                                         |
+| ARRAY         | ARRAY                                         |
+| MAP           | MAP                                           |
+| ROW           | ROW                                           |
 | VARCHAR       | Not supported, suggest to use STRING instead. |
 | VARBINARY     | Not supported, suggest to use BYTES instead.  |
 | INTERVAL      | Not supported                                 |
-| ARRAY         | Not supported                                 |
-| MAP           | Not supported                                 |
 | MULTISET      | Not supported                                 |
-| ROW           | Not supported                                 |
 | RAW           | Not supported                                 |

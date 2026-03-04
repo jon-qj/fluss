@@ -22,9 +22,13 @@ import org.apache.fluss.client.metadata.KvSnapshotMetadata;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.cluster.ServerNode;
+import org.apache.fluss.cluster.rebalance.GoalType;
+import org.apache.fluss.cluster.rebalance.RebalanceProgress;
+import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.ConfigEntry;
+import org.apache.fluss.exception.AuthorizationException;
 import org.apache.fluss.exception.DatabaseAlreadyExistException;
 import org.apache.fluss.exception.DatabaseNotEmptyException;
 import org.apache.fluss.exception.DatabaseNotExistException;
@@ -35,10 +39,15 @@ import org.apache.fluss.exception.InvalidReplicationFactorException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvSnapshotNotExistException;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
+import org.apache.fluss.exception.NoRebalanceInProgressException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.PartitionAlreadyExistsException;
 import org.apache.fluss.exception.PartitionNotExistException;
+import org.apache.fluss.exception.RebalanceFailureException;
 import org.apache.fluss.exception.SchemaNotExistException;
+import org.apache.fluss.exception.ServerNotExistException;
+import org.apache.fluss.exception.ServerTagAlreadyExistException;
+import org.apache.fluss.exception.ServerTagNotExistException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
@@ -46,6 +55,7 @@ import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.exception.TooManyPartitionsException;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -55,11 +65,16 @@ import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metadata.TableStats;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 
+import javax.annotation.Nullable;
+
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -165,6 +180,20 @@ public interface Admin extends AutoCloseable {
 
     /** List all databases in fluss cluster asynchronously. */
     CompletableFuture<List<String>> listDatabases();
+
+    /**
+     * List all databases' summary information in fluss cluster asynchronously. The difference
+     * between this method and {@link #listDatabases()} is that this method also include some
+     * summaries for the database, like {@link DatabaseSummary#getCreatedTime()} and {@link
+     * DatabaseSummary#getTableCount()}.
+     *
+     * <p>When interacting older version of fluss cluster which does not support this API, it will
+     * fall back to {@link #listDatabases()} with {@code -1} value for {@link
+     * DatabaseSummary#getCreatedTime()} and {@link DatabaseSummary#getTableCount()}.
+     *
+     * @since 0.9
+     */
+    CompletableFuture<List<DatabaseSummary>> listDatabaseSummaries();
 
     /**
      * Create a new table asynchronously.
@@ -401,20 +430,82 @@ public interface Admin extends AutoCloseable {
             TableBucket bucket, long snapshotId);
 
     /**
-     * Get table lake snapshot info of the given table asynchronously.
+     * Creates a new KV snapshot lease with the given ID and duration.
      *
-     * <p>It'll get the latest snapshot for all the buckets of the table.
+     * @param leaseId the unique identifier for the lease
+     * @param leaseDurationMs the lease duration in milliseconds
+     * @return a {@link KvSnapshotLease} instance representing the created lease
+     */
+    KvSnapshotLease createKvSnapshotLease(String leaseId, long leaseDurationMs);
+
+    /**
+     * Retrieves the absolute latest lake snapshot metadata for a table asynchronously.
      *
-     * <p>The following exceptions can be anticipated when calling {@code get()} on returned future.
+     * <p>This returns the most recent snapshot regardless of its visibility or compaction status.
+     * It includes the latest tiered offsets for all buckets.
+     *
+     * <p><b>NOTE: This API is not intended for union reads and should be considered internal.</b>
+     * For union read operations (e.g. Flink/Spark reading from Fluss + lake), use {@link
+     * #getReadableLakeSnapshot(TablePath)} instead. Using this method for union reads can lead to
+     * data loss when the latest tiered snapshot is not yet readable (e.g. Paimon DV tables with
+     * un-compacted L0 data). This method remains for internal use cases such as tiering commit and
+     * readable-offset resolution.
+     *
+     * <p>Exceptions expected when calling {@code get()} on the returned future:
      *
      * <ul>
-     *   <li>{@link TableNotExistException} if the table does not exist.
-     *   <li>{@link LakeTableSnapshotNotExistException} if no any lake snapshot exist.
+     *   <li>{@link TableNotExistException}: If the table does not exist.
+     *   <li>{@link LakeTableSnapshotNotExistException}: If no any snapshots.
      * </ul>
      *
-     * @param tablePath the table path of the table.
+     * @param tablePath The path of the target table.
+     * @return A future returning the latest tiered snapshot.
      */
     CompletableFuture<LakeSnapshot> getLatestLakeSnapshot(TablePath tablePath);
+
+    /**
+     * Retrieves a specific historical lake snapshot by its ID asynchronously.
+     *
+     * <p>It provides the tiered bucket offsets as they existed at the moment the specified snapshot
+     * was committed.
+     *
+     * <p>Exceptions expected when calling {@code get()} on the returned future:
+     *
+     * <ul>
+     *   <li>{@link TableNotExistException}: If the table does not exist.
+     *   <li>{@link LakeTableSnapshotNotExistException}: If the specified snapshot ID is missing in
+     *       Fluss
+     * </ul>
+     *
+     * @param tablePath The path of the target table.
+     * @param snapshotId The unique identifier of the snapshot.
+     * @return A future returning the specific lake snapshot.
+     */
+    CompletableFuture<LakeSnapshot> getLakeSnapshot(TablePath tablePath, long snapshotId);
+
+    /**
+     * Retrieves the latest readable lake snapshot and its corresponding readable log offsets.
+     *
+     * <p>For Paimon DV tables, the tiered log offset may not be readable because the corresponding
+     * data might be in the L0 layer. Using tiered offset directly can lead to data loss. This
+     * method returns a readable snapshot (where L0 data has been compacted) and its corresponding
+     * readable offsets, which represent safe log offsets that can be read without data loss.
+     *
+     * <p>For union read operations, use this method instead of {@link
+     * #getLatestLakeSnapshot(TablePath)} to ensure data safety and avoid data loss.
+     *
+     * <p>Exceptions expected when calling {@code get()} on the returned future:
+     *
+     * <ul>
+     *   <li>{@link TableNotExistException}: If the table does not exist.
+     *   <li>{@link LakeTableSnapshotNotExistException}: If no readable snapshot exists yet.
+     * </ul>
+     *
+     * @param tablePath The path of the target table.
+     * @return A future returning a {@link LakeSnapshot} containing the readable snapshot ID and
+     *     readable log offsets for each bucket.
+     */
+    CompletableFuture<LakeSnapshot> getReadableLakeSnapshot(TablePath tablePath);
 
     /**
      * List offset for the specified buckets. This operation enables to find the beginning offset,
@@ -442,6 +533,13 @@ public interface Admin extends AutoCloseable {
             String partitionName,
             Collection<Integer> buckets,
             OffsetSpec offsetSpec);
+
+    /**
+     * Asynchronously gets the statistics of this table.
+     *
+     * @return A future TableStats
+     */
+    CompletableFuture<TableStats> getTableStats(TablePath tablePath);
 
     /**
      * Retrieves ACL entries filtered by principal for the specified resource.
@@ -492,4 +590,165 @@ public interface Admin extends AutoCloseable {
      * @return A CompletableFuture indicating completion of the operation.
      */
     CompletableFuture<Void> alterClusterConfigs(Collection<AlterConfig> configs);
+
+    /**
+     * Add server tag to the specified tabletServers, one tabletServer can only have one serverTag.
+     *
+     * <p>If one tabletServer failed adding tag, none of the tags will take effect.
+     *
+     * <p>If one tabletServer already has a serverTag, and the serverTag is same with the existing
+     * one, this operation will be ignored.
+     *
+     * <ul>
+     *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
+     *       permissions.
+     *   <li>{@link ServerNotExistException} If the tabletServer in {@code tabletServers} does not
+     *       exist.
+     *   <li>{@link ServerTagAlreadyExistException} If the server tag already exists for any one of
+     *       the tabletServers, and the server tag is different from the existing one.
+     * </ul>
+     *
+     * @param tabletServers the tabletServers we want to add server tags.
+     * @param serverTag the server tag to be added.
+     */
+    CompletableFuture<Void> addServerTag(List<Integer> tabletServers, ServerTag serverTag);
+
+    /**
+     * Remove server tag from the specified tabletServers.
+     *
+     * <p>If one tabletServer failed removing tag, none of the tags will be removed.
+     *
+     * <p>No exception will be thrown if the server already has no any server tag now.
+     *
+     * <ul>
+     *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
+     *       permissions.
+     *   <li>{@link ServerNotExistException} If the tabletServer in {@code tabletServers} does not
+     *       exist.
+     *   <li>{@link ServerTagNotExistException} If the server tag does not exist for any one of the
+     *       tabletServers.
+     * </ul>
+     *
+     * @param tabletServers the tabletServers we want to remove server tags.
+     */
+    CompletableFuture<Void> removeServerTag(List<Integer> tabletServers, ServerTag serverTag);
+
+    /**
+     * Based on the provided {@code priorityGoals}, Fluss performs load balancing on the cluster's
+     * bucket load.
+     *
+     * <p>More details, Fluss collects the cluster's load information and optimizes to perform load
+     * balancing according to the user-defined {@code priorityGoals}.
+     *
+     * <p>Currently, Fluss only supports one active rebalance task in the cluster. If an uncompleted
+     * rebalance task exists, Fluss will return the uncompleted rebalance task's progress.
+     *
+     * <p>If you want to cancel the rebalance task, you can use {@link #cancelRebalance(String)}
+     *
+     * <ul>
+     *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
+     *       permissions.
+     *   <li>{@link RebalanceFailureException} If the rebalance failed. Such as there is an
+     *       inProgress execution.
+     * </ul>
+     *
+     * @param priorityGoals the goals to be optimized.
+     * @return the rebalance id. If there is no rebalance task in progress, it will trigger a new
+     *     rebalance task and return the rebalance id.
+     */
+    CompletableFuture<String> rebalance(List<GoalType> priorityGoals);
+
+    /**
+     * List the rebalance progress.
+     *
+     * <ul>
+     *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
+     *       permissions.
+     *   <li>{@link NoRebalanceInProgressException} If there are no rebalance tasks in progress for
+     *       the input rebalanceId.
+     * </ul>
+     *
+     * @param rebalanceId the rebalance id to list progress, if it is null means list the in
+     *     progress rebalance task's.
+     * @return the rebalance process.
+     */
+    CompletableFuture<Optional<RebalanceProgress>> listRebalanceProgress(
+            @Nullable String rebalanceId);
+
+    /**
+     * Cannel the rebalance task.
+     *
+     * <ul>
+     *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
+     *       permissions.
+     *   <li>{@link NoRebalanceInProgressException} If there are no rebalance tasks in progress or
+     *       the rebalance id is not exists.
+     * </ul>
+     *
+     * @param rebalanceId the rebalance id to cancel, if it is null means cancel the exists
+     *     rebalance task. If rebalanceId is not exists in server, {@link
+     *     NoRebalanceInProgressException} will be thrown.
+     */
+    CompletableFuture<Void> cancelRebalance(@Nullable String rebalanceId);
+
+    // ==================================================================================
+    // Producer Offset Management APIs (for Exactly-Once Semantics)
+    // ==================================================================================
+
+    /**
+     * Register producer offset snapshot.
+     *
+     * <p>This method provides atomic "check and register" semantics:
+     *
+     * <ul>
+     *   <li>If snapshot does not exist: create new snapshot and return {@link
+     *       RegisterResult#CREATED}
+     *   <li>If snapshot already exists: do NOT overwrite and return {@link
+     *       RegisterResult#ALREADY_EXISTS}
+     * </ul>
+     *
+     * <p>The atomicity is guaranteed by the server implementation. This enables the caller to
+     * determine whether undo recovery is needed based on the return value.
+     *
+     * <p>The snapshot will be automatically cleaned up after the configured TTL expires.
+     *
+     * <p>This API is typically used by Flink Operator Coordinator at job startup to register the
+     * initial offset snapshot before any data is written.
+     *
+     * @param producerId the ID of the producer (typically Flink job ID)
+     * @param offsets map of TableBucket to offset for all tables
+     * @return a CompletableFuture containing the registration result indicating whether the
+     *     snapshot was newly created or already existed
+     * @since 0.9
+     */
+    CompletableFuture<RegisterResult> registerProducerOffsets(
+            String producerId, Map<TableBucket, Long> offsets);
+
+    /**
+     * Get producer offset snapshot.
+     *
+     * <p>This method retrieves the registered offset snapshot for a producer. Returns null if no
+     * snapshot exists for the given producer ID.
+     *
+     * <p>This API is typically used by Flink Operator Coordinator at job startup to check if a
+     * previous snapshot exists (indicating a failover before first checkpoint).
+     *
+     * @param producerId the ID of the producer
+     * @return a CompletableFuture containing the producer offsets, or null if not found
+     * @since 0.9
+     */
+    CompletableFuture<ProducerOffsetsResult> getProducerOffsets(String producerId);
+
+    /**
+     * Delete producer offset snapshot.
+     *
+     * <p>This method deletes the registered offset snapshot for a producer. This is typically
+     * called after the first checkpoint completes successfully, as the checkpoint state will be
+     * used for recovery instead of the initial snapshot.
+     *
+     * @param producerId the ID of the producer
+     * @return a CompletableFuture that completes when deletion succeeds
+     * @since 0.9
+     */
+    CompletableFuture<Void> deleteProducerOffsets(String producerId);
 }

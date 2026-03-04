@@ -63,7 +63,7 @@ public class TableAssignmentUtils {
         }
 
         if (Arrays.stream(servers).noneMatch(tsInfo -> tsInfo.getRack() != null)) {
-            return generateRackUnawareAssigment(
+            return generateRackUnawareAssignment(
                     nBuckets,
                     replicationFactor,
                     Arrays.stream(servers).mapToInt(TabletServerInfo::getId).toArray(),
@@ -74,7 +74,7 @@ public class TableAssignmentUtils {
                 throw new InvalidServerRackInfoException(
                         "Not all tabletServers have rack information for replica rack aware assignment.");
             } else {
-                return generateRackAwareAssigment(
+                return generateRackAwareAssignment(
                         nBuckets, replicationFactor, servers, startIndex, nextReplicaShift);
             }
         }
@@ -107,12 +107,12 @@ public class TableAssignmentUtils {
      * <tr><td>bucket5      </td><td>bucket6      </td><td>bucket7      </td><td>bucket8      </td><td>bucket9      </td><td>(1st replica)</td></tr>
      * <tr><td>bucket4      </td><td>bucket0      </td><td>bucket1      </td><td>bucket2      </td><td>bucket3      </td><td>(2nd replica)</td></tr>
      * <tr><td>bucket8      </td><td>bucket9      </td><td>bucket5      </td><td>bucket6      </td><td>bucket7      </td><td>(2nd replica)</td></tr>
-     * <tr><td>bucket3      </td><td>bucket4      </td><td>bucket0      </td><td>bucket1      </td><td>bucket2      </td><td>(3nd replica)</td></tr>
-     * <tr><td>bucket7      </td><td>bucket8      </td><td>bucket9      </td><td>bucket5      </td><td>bucket6      </td><td>(3nd replica)</td></tr>
+     * <tr><td>bucket3      </td><td>bucket4      </td><td>bucket0      </td><td>bucket1      </td><td>bucket2      </td><td>(3rd replica)</td></tr>
+     * <tr><td>bucket7      </td><td>bucket8      </td><td>bucket9      </td><td>bucket5      </td><td>bucket6      </td><td>(3rd replica)</td></tr>
      * </table>
      *
-     * <p>To create rack aware assigment, this API will first create a rack alternated tabletServers
-     * list. For example, from this tabletServerId -> rack mapping:
+     * <p>To create rack aware assignment, this API will first create a rack alternated
+     * tabletServers list. For example, from this tabletServerId -> rack mapping:
      *
      * <pre>
      *     0 -> "rack1"
@@ -172,7 +172,7 @@ public class TableAssignmentUtils {
                 randomInt(servers.length));
     }
 
-    private static TableAssignment generateRackUnawareAssigment(
+    private static TableAssignment generateRackUnawareAssignment(
             int nBuckets,
             int replicationFactor,
             int[] serverIds,
@@ -198,7 +198,7 @@ public class TableAssignmentUtils {
         return new TableAssignment(assignments);
     }
 
-    private static TableAssignment generateRackAwareAssigment(
+    private static TableAssignment generateRackAwareAssignment(
             int nBuckets,
             int replicationFactor,
             TabletServerInfo[] servers,
@@ -224,31 +224,31 @@ public class TableAssignmentUtils {
             replicas.add(leader);
             Set<String> racksWithReplicas = new HashSet<>();
             racksWithReplicas.add(serverRackMap.get(leader));
-            Set<Integer> brokersWithReplicas = new HashSet<>();
-            brokersWithReplicas.add(leader);
+            Set<Integer> tabletServersWithReplicas = new HashSet<>();
+            tabletServersWithReplicas.add(leader);
             int k = 0;
             for (int j = 0; j < replicationFactor - 1; j++) {
                 boolean done = false;
                 while (!done) {
-                    Integer broker =
+                    Integer server =
                             arrangedServerList.get(
                                     replicaIndex(
                                             firstReplicaIndex,
                                             nextReplicaShift * numRacks,
                                             k,
                                             arrangedServerList.size()));
-                    String rack = serverRackMap.get(broker);
+                    String rack = serverRackMap.get(server);
                     // Skip this tabletServer if
                     // 1. there is already a tabletServer in the same rack that has assigned a
                     // replica AND there is one or more racks that do not have any replica, or
                     // 2. the tabletServer has already assigned a replica AND there is one or more
                     // tabletServers that do not have replica assigned
                     if ((!racksWithReplicas.contains(rack) || racksWithReplicas.size() == numRacks)
-                            && (!brokersWithReplicas.contains(broker)
-                                    || brokersWithReplicas.size() == numServers)) {
-                        replicas.add(broker);
+                            && (!tabletServersWithReplicas.contains(server)
+                                    || tabletServersWithReplicas.size() == numServers)) {
+                        replicas.add(server);
                         racksWithReplicas.add(rack);
-                        brokersWithReplicas.add(broker);
+                        tabletServersWithReplicas.add(server);
                         done = true;
                     }
                     k += 1;

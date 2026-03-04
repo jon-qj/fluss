@@ -43,8 +43,8 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.metadata.BucketMetadata;
 import org.apache.fluss.server.metadata.PartitionMetadata;
 import org.apache.fluss.server.metadata.TableMetadata;
-import org.apache.fluss.server.zk.data.LakeTableSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -240,7 +240,8 @@ public class CoordinatorRequestBatch {
     public void addStopReplicaRequestForTabletServers(
             Set<Integer> tabletServers,
             TableBucket tableBucket,
-            boolean isDelete,
+            boolean deleteLocal,
+            boolean deleteRemote,
             int leaderEpoch) {
         tabletServers.stream()
                 .filter(s -> s >= 0)
@@ -250,12 +251,18 @@ public class CoordinatorRequestBatch {
                                     stopReplicaRequestMap.computeIfAbsent(id, k -> new HashMap<>());
                             // reduce delete flag, if it has been marked as deleted,
                             // we will set it as delete replica
-                            boolean alreadyDelete =
+                            boolean alreadyDeleteLocal =
                                     stopBucketReplica.get(tableBucket) != null
                                             && stopBucketReplica.get(tableBucket).isDelete();
+                            boolean alreadyDeleteRemote =
+                                    stopBucketReplica.get(tableBucket) != null
+                                            && stopBucketReplica.get(tableBucket).isDeleteRemote();
                             PbStopReplicaReqForBucket protoStopReplicaForBucket =
                                     makeStopBucketReplica(
-                                            tableBucket, alreadyDelete || isDelete, leaderEpoch);
+                                            tableBucket,
+                                            alreadyDeleteLocal || deleteLocal,
+                                            alreadyDeleteRemote || deleteRemote,
+                                            leaderEpoch);
                             stopBucketReplica.put(tableBucket, protoStopReplicaForBucket);
                         });
     }
@@ -269,18 +276,21 @@ public class CoordinatorRequestBatch {
      *       none-partitioned table
      *   <li>case3: Table create and bucketAssignment don't generated, case will happen for new
      *       created partitioned table
-     *   <li>case4: Table is queued for deletion, in this case we will set a empty tableBucket set
+     *   <li>case4: Table is queued for deletion, in this case we will set an empty tableBucket set
      *       and tableId set to {@link TableMetadata#DELETED_TABLE_ID} to avoid send unless info to
      *       tabletServer
      *   <li>case5: Partition create and bucketAssignment of this partition generated.
-     *   <li>case6: Partition is queued for deletion, in this case we will set a empty tableBucket
+     *   <li>case6: Partition is queued for deletion, in this case we will set an empty tableBucket
      *       set and partitionId set to {@link PartitionMetadata#DELETED_PARTITION_ID } to avoid
      *       send unless info to tabletServer
      *   <li>case7: Leader and isr is changed for these input tableBuckets
      *   <li>case8: One newly tabletServer added into cluster
      *   <li>case9: One tabletServer is removed from cluster
+     *   <li>case10: schemaId is changed after table is created.
+     *   <li>case 11: TableRegistration changed after table is created.
      * </ol>
      */
+    // todo: improve this with different phase enum.
     public void addUpdateMetadataRequestForTabletServers(
             Set<Integer> tabletServers,
             @Nullable Long tableId,
@@ -298,7 +308,7 @@ public class CoordinatorRequestBatch {
                         .computeIfAbsent(tableId, k -> new HashMap<>())
                         .put(partitionId, Collections.emptyList());
             } else {
-                // case3, case4
+                // case3, case4, case10, case 11
                 updateMetadataRequestBucketMap.put(tableId, Collections.emptyList());
             }
         } else {
@@ -306,6 +316,7 @@ public class CoordinatorRequestBatch {
             for (TableBucket tableBucket : tableBuckets) {
                 long currentTableId = tableBucket.getTableId();
                 Long currentPartitionId = tableBucket.getPartitionId();
+                // case1, case2
                 Optional<LeaderAndIsr> bucketLeaderAndIsr =
                         coordinatorContext.getBucketLeaderAndIsr(tableBucket);
                 Integer leaderEpoch =
@@ -375,7 +386,8 @@ public class CoordinatorRequestBatch {
     public void addNotifyLakeTableOffsetRequestForTableServers(
             List<Integer> tabletServers,
             TableBucket tableBucket,
-            LakeTableSnapshot lakeTableSnapshot) {
+            LakeTableSnapshot lakeTableSnapshot,
+            @Nullable Long maxTieredTimestamp) {
         tabletServers.stream()
                 .filter(s -> s >= 0)
                 .forEach(
@@ -387,7 +399,7 @@ public class CoordinatorRequestBatch {
                             notifyLakeTableOffsetReqForBucketMap.put(
                                     tableBucket,
                                     makeNotifyLakeTableOffsetForBucket(
-                                            tableBucket, lakeTableSnapshot));
+                                            tableBucket, lakeTableSnapshot, maxTieredTimestamp));
                         });
     }
 
@@ -442,7 +454,7 @@ public class CoordinatorRequestBatch {
             // we collect the buckets whose replica is to be deleted
             Set<TableBucket> deletedReplicaBuckets =
                     stopReplicas.values().stream()
-                            .filter(PbStopReplicaReqForBucket::isDelete)
+                            .filter(pbBucket -> pbBucket.isDelete() && pbBucket.isDeleteRemote())
                             .map(t -> toTableBucket(t.getTableBucket()))
                             .collect(Collectors.toSet());
 

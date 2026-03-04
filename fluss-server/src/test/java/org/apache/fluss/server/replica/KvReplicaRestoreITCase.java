@@ -21,13 +21,16 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.utils.ExceptionUtils;
@@ -42,11 +45,13 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.server.testutils.KvTestUtils.assertLookupResponse;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.dropDatabase;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newLookupRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
@@ -54,6 +59,7 @@ import static org.apache.fluss.testutils.DataTestUtils.genKvRecords;
 import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.DataTestUtils.toKvRecordBatch;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** The IT case for the restoring of kv replica. */
 class KvReplicaRestoreITCase {
@@ -81,9 +87,14 @@ class KvReplicaRestoreITCase {
         int bucketNum = 3;
         List<TableBucket> tableBuckets = new ArrayList<>();
         for (int i = 0; i < tableNum; i++) {
+            TableDescriptor tableDescriptor =
+                    TableDescriptor.builder()
+                            .schema(DATA1_SCHEMA_PK)
+                            .distributedBy(3, "a")
+                            .logFormat(i % 2 == 0 ? LogFormat.ARROW : LogFormat.COMPACTED)
+                            .build();
             TablePath tablePath = TablePath.of("test_db", "test_table_" + i);
-            long tableId =
-                    createTable(FLUSS_CLUSTER_EXTENSION, tablePath, DATA1_TABLE_DESCRIPTOR_PK);
+            long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
             for (int bucket = 0; bucket < bucketNum; bucket++) {
                 tableBuckets.add(new TableBucket(tableId, bucket));
             }
@@ -191,6 +202,69 @@ class KvReplicaRestoreITCase {
                             .get(),
                     keyValue.f1);
         }
+
+        // restart the failed server to make sure the cluster is healthy for other tests
+        dropDatabase(FLUSS_CLUSTER_EXTENSION, "test_db");
+        FLUSS_CLUSTER_EXTENSION.stopTabletServer(leaderServer);
+        FLUSS_CLUSTER_EXTENSION.startTabletServer(leaderServer);
+        FLUSS_CLUSTER_EXTENSION.assertHasTabletServerNumber(3);
+    }
+
+    @Test
+    void testRowCountRecoveryAfterFailover() throws Exception {
+        // Create a primary key table
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(DATA1_SCHEMA_PK).distributedBy(1, "a").build();
+        TablePath tablePath = TablePath.of("test_db", "test_row_count_recovery");
+        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+
+        // Wait for replica to become leader
+        FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket);
+        int leaderServer = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
+
+        // Insert 100 records
+        int recordCount = 100;
+        List<KvRecord> records = new ArrayList<>();
+        for (int i = 0; i < recordCount; i++) {
+            records.addAll(genKvRecords(new Object[] {i, "value" + i}));
+        }
+        putRecordBatch(tableBucket, leaderServer, toKvRecordBatch(records)).join();
+
+        // Verify initial row count
+        Replica leaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket);
+        assertThat(leaderReplica.getRowCount()).isEqualTo(recordCount);
+
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tablePath);
+
+        // Verify the snapshot contains row count
+        CompletedSnapshot completedSnapshot =
+                completedSnapshotHandleStore
+                        .getLatestCompletedSnapshotHandle(tableBucket)
+                        .get()
+                        .retrieveCompleteSnapshot();
+        assertThat(completedSnapshot.getRowCount()).isNotNull();
+        assertThat(completedSnapshot.getRowCount()).isEqualTo(recordCount);
+
+        // Trigger another write to generate changelogs not in snapshot
+        List<KvRecord> moreRecords = new ArrayList<>();
+        for (int i = recordCount; i < recordCount + 10; i++) {
+            moreRecords.addAll(genKvRecords(new Object[] {i, "value" + i}));
+        }
+        recordCount = recordCount + 10;
+        putRecordBatch(tableBucket, leaderServer, toKvRecordBatch(moreRecords)).join();
+
+        // simulate failure and force failover
+        int currentLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
+        FLUSS_CLUSTER_EXTENSION.stopTabletServer(currentLeader);
+        FLUSS_CLUSTER_EXTENSION.startTabletServer(currentLeader);
+
+        // Get the new leader replica
+        Replica newLeaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket);
+        assertThat(newLeaderReplica.getLeaderId()).isNotEqualTo(currentLeader);
+
+        // Verify the row count is restored correctly after failover and applied changelogs
+        assertThat(newLeaderReplica.getRowCount()).isEqualTo(recordCount);
     }
 
     private static Configuration initConfig() {
@@ -206,13 +280,13 @@ class KvReplicaRestoreITCase {
         return conf;
     }
 
-    private void putRecordBatch(
+    private CompletableFuture<?> putRecordBatch(
             TableBucket tableBucket, int leaderServer, KvRecordBatch kvRecordBatch) {
         PutKvRequest putKvRequest =
                 newPutKvRequest(
                         tableBucket.getTableId(), tableBucket.getBucket(), -1, kvRecordBatch);
         TabletServerGateway leaderGateway =
                 FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leaderServer);
-        leaderGateway.putKv(putKvRequest);
+        return leaderGateway.putKv(putKvRequest);
     }
 }

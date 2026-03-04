@@ -18,13 +18,14 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import lightTheme from './src/utils/prismLight';
 import versionReplace from './src/plugins/remark-version-replace/index';
 import { loadVersionData } from './src/utils/versionData';
 const { versionsMap, latestVersion } = loadVersionData();
 
 const config: Config = {
   title: 'Apache Fluss™ (Incubating)',
-  tagline: 'Streaming Storage for Real-Time Analytics',
+  tagline: 'Streaming Storage for Real-Time Analytics & AI',
   favicon: 'img/logo/fluss_favicon.svg',
 
   // Set the production url of your site here
@@ -41,7 +42,6 @@ const config: Config = {
   trailingSlash: true,
 
   onBrokenLinks: 'throw',
-  onBrokenMarkdownLinks: 'warn',
 
   // Even if you don't use internationalization, you can use this field to set
   // useful metadata like html lang. For example, if your site is Chinese, you
@@ -51,7 +51,11 @@ const config: Config = {
     locales: ['en'],
   },
 
-
+  markdown: {
+    hooks: {
+      onBrokenMarkdownLinks: 'warn'
+    }
+  },
 
   presets: [
     [
@@ -121,6 +125,32 @@ const config: Config = {
           ],
       },
     ],
+    [
+      '@docusaurus/plugin-client-redirects',
+      {
+          // Create redirects from the available routes that have already been created
+          createRedirects(existingPath) {
+            // Only evaluate paths related to documentation
+            if (!existingPath.startsWith('/docs/')) {
+              return undefined;
+            }
+            
+            // Extract the relative path after /docs/
+            const relativeDocsPath = existingPath.substring(6); 
+            const firstSegment = relativeDocsPath.split('/')[0];
+            
+            // Exclude any known version identifiers aligned with existing routes
+            const existingVersionedRoutes = ['next', ...Object.keys(versionsMap)];
+            if (existingVersionedRoutes.includes(firstSegment)) {
+              return undefined;
+            }
+            
+            // Redirect the explicit versioned path to the implicit unversioned path
+            return [`/docs/${latestVersion}${existingPath.replace('/docs', '')}`];
+        },
+      },
+    ],
+
   ],
   themeConfig: {
     image: 'img/logo/png/colored_logo.png',
@@ -164,6 +194,7 @@ const config: Config = {
             label: 'ASF', position: 'right', items: [
                 {to: 'https://www.apache.org/', label: 'Foundation'},
                 {to: 'https://www.apache.org/licenses/', label: 'License'},
+                {to: 'https://events.apache.org', label: 'Events'},
                 {to: 'https://www.apache.org/foundation/sponsorship.html', label: 'Donate'},
                 {to: 'https://www.apache.org/foundation/thanks.html', label: 'Sponsors'},
                 {to: 'https://www.apache.org/security/', label: 'Security'},
@@ -196,9 +227,9 @@ const config: Config = {
                   <p>Apache, the names of Apache projects, and the feather logo are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. All other marks mentioned may be trademarks or registered trademarks of their respective owners.</p>`,
     },
     prism: {
-      theme: prismThemes.vsDark,
+      theme: lightTheme,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['java', 'bash']
+      additionalLanguages: ['java', 'bash', 'scala']
     },
     algolia: {
       appId: "X8KSGGLJW1",

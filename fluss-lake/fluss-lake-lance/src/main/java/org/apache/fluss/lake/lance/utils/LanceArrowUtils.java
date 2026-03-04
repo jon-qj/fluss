@@ -17,30 +17,13 @@
 
 package org.apache.fluss.lake.lance.utils;
 
-import org.apache.fluss.lake.lance.writers.ArrowBigIntWriter;
-import org.apache.fluss.lake.lance.writers.ArrowBinaryWriter;
-import org.apache.fluss.lake.lance.writers.ArrowBooleanWriter;
-import org.apache.fluss.lake.lance.writers.ArrowDateWriter;
-import org.apache.fluss.lake.lance.writers.ArrowDecimalWriter;
-import org.apache.fluss.lake.lance.writers.ArrowDoubleWriter;
-import org.apache.fluss.lake.lance.writers.ArrowFieldWriter;
-import org.apache.fluss.lake.lance.writers.ArrowFloatWriter;
-import org.apache.fluss.lake.lance.writers.ArrowIntWriter;
-import org.apache.fluss.lake.lance.writers.ArrowSmallIntWriter;
-import org.apache.fluss.lake.lance.writers.ArrowTimeWriter;
-import org.apache.fluss.lake.lance.writers.ArrowTimestampLtzWriter;
-import org.apache.fluss.lake.lance.writers.ArrowTimestampNtzWriter;
-import org.apache.fluss.lake.lance.writers.ArrowTinyIntWriter;
-import org.apache.fluss.lake.lance.writers.ArrowVarBinaryWriter;
-import org.apache.fluss.lake.lance.writers.ArrowVarCharWriter;
-import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.types.ArrayType;
 import org.apache.fluss.types.BigIntType;
 import org.apache.fluss.types.BinaryType;
 import org.apache.fluss.types.BooleanType;
 import org.apache.fluss.types.BytesType;
 import org.apache.fluss.types.CharType;
 import org.apache.fluss.types.DataType;
-import org.apache.fluss.types.DataTypeDefaultVisitor;
 import org.apache.fluss.types.DateType;
 import org.apache.fluss.types.DecimalType;
 import org.apache.fluss.types.DoubleType;
@@ -54,24 +37,6 @@ import org.apache.fluss.types.TimeType;
 import org.apache.fluss.types.TimestampType;
 import org.apache.fluss.types.TinyIntType;
 
-import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.BitVector;
-import org.apache.arrow.vector.DateDayVector;
-import org.apache.arrow.vector.DecimalVector;
-import org.apache.arrow.vector.FixedSizeBinaryVector;
-import org.apache.arrow.vector.Float4Vector;
-import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.SmallIntVector;
-import org.apache.arrow.vector.TimeMicroVector;
-import org.apache.arrow.vector.TimeMilliVector;
-import org.apache.arrow.vector.TimeNanoVector;
-import org.apache.arrow.vector.TimeSecVector;
-import org.apache.arrow.vector.TimeStampVector;
-import org.apache.arrow.vector.TinyIntVector;
-import org.apache.arrow.vector.ValueVector;
-import org.apache.arrow.vector.VarBinaryVector;
-import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
@@ -80,102 +45,120 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
-/** Utilities for Arrow. */
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+
+/**
+ * Utilities for converting Fluss RowType to non-shaded Arrow Schema. This is needed because Lance
+ * requires non-shaded Arrow API.
+ */
 public class LanceArrowUtils {
-    /** Returns the Arrow schema of the specified type. */
+
+    /** Property suffix for configuring a fixed-size list Arrow type on array columns. */
+    public static final String FIXED_SIZE_LIST_SIZE_SUFFIX = ".arrow.fixed-size-list.size";
+
+    /** Returns the non-shaded Arrow schema of the specified Fluss RowType. */
     public static Schema toArrowSchema(RowType rowType) {
+        return toArrowSchema(rowType, Collections.emptyMap());
+    }
+
+    /**
+     * Returns the non-shaded Arrow schema of the specified Fluss RowType, using table properties to
+     * determine whether array columns should use FixedSizeList instead of List.
+     *
+     * <p>When a table property {@code <column>.arrow.fixed-size-list.size} is set, the
+     * corresponding ARRAY column will be emitted as {@code FixedSizeList<element>(size)} instead of
+     * {@code List<element>}.
+     */
+    public static Schema toArrowSchema(RowType rowType, Map<String, String> tableProperties) {
         List<Field> fields =
                 rowType.getFields().stream()
-                        .map(f -> toArrowField(f.getName(), f.getType()))
+                        .map(f -> toArrowField(f.getName(), f.getType(), tableProperties))
                         .collect(Collectors.toList());
         return new Schema(fields);
     }
 
-    private static Field toArrowField(String fieldName, DataType logicalType) {
-        FieldType fieldType =
-                new FieldType(
-                        logicalType.isNullable(),
-                        logicalType.accept(DataTypeToArrowTypeConverter.INSTANCE),
-                        null);
-        return new Field(fieldName, fieldType, null);
+    private static Field toArrowField(
+            String fieldName, DataType logicalType, Map<String, String> tableProperties) {
+        checkArgument(
+                !fieldName.contains("."),
+                "Column name '%s' must not contain periods. "
+                        + "Lance does not support field names with periods.",
+                fieldName);
+        ArrowType arrowType;
+        if (logicalType instanceof ArrayType && tableProperties != null) {
+            String sizeStr = tableProperties.get(fieldName + FIXED_SIZE_LIST_SIZE_SUFFIX);
+            if (sizeStr != null) {
+                int listSize;
+                try {
+                    listSize = Integer.parseInt(sizeStr);
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException(
+                            String.format(
+                                    "Invalid value '%s' for property '%s', expected a positive integer.",
+                                    sizeStr, fieldName + FIXED_SIZE_LIST_SIZE_SUFFIX),
+                            e);
+                }
+
+                checkArgument(
+                        listSize > 0,
+                        "Invalid value '%s' for property '%s'. Expected a positive integer.",
+                        sizeStr,
+                        fieldName + FIXED_SIZE_LIST_SIZE_SUFFIX);
+                arrowType = new ArrowType.FixedSizeList(listSize);
+            } else {
+                arrowType = toArrowType(logicalType);
+            }
+        } else {
+            arrowType = toArrowType(logicalType);
+        }
+        FieldType fieldType = new FieldType(logicalType.isNullable(), arrowType, null);
+        List<Field> children = null;
+        if (logicalType instanceof ArrayType) {
+            children =
+                    Collections.singletonList(
+                            toArrowField(
+                                    "element",
+                                    ((ArrayType) logicalType).getElementType(),
+                                    tableProperties));
+        }
+        return new Field(fieldName, fieldType, children);
     }
 
-    private static class DataTypeToArrowTypeConverter extends DataTypeDefaultVisitor<ArrowType> {
-
-        private static final DataTypeToArrowTypeConverter INSTANCE =
-                new DataTypeToArrowTypeConverter();
-
-        @Override
-        public ArrowType visit(TinyIntType tinyIntType) {
+    private static ArrowType toArrowType(DataType dataType) {
+        if (dataType instanceof TinyIntType) {
             return new ArrowType.Int(8, true);
-        }
-
-        @Override
-        public ArrowType visit(SmallIntType smallIntType) {
-            return new ArrowType.Int(2 * 8, true);
-        }
-
-        @Override
-        public ArrowType visit(IntType intType) {
-            return new ArrowType.Int(4 * 8, true);
-        }
-
-        @Override
-        public ArrowType visit(BigIntType bigIntType) {
-            return new ArrowType.Int(8 * 8, true);
-        }
-
-        @Override
-        public ArrowType visit(BooleanType booleanType) {
+        } else if (dataType instanceof SmallIntType) {
+            return new ArrowType.Int(16, true);
+        } else if (dataType instanceof IntType) {
+            return new ArrowType.Int(32, true);
+        } else if (dataType instanceof BigIntType) {
+            return new ArrowType.Int(64, true);
+        } else if (dataType instanceof BooleanType) {
             return ArrowType.Bool.INSTANCE;
-        }
-
-        @Override
-        public ArrowType visit(FloatType floatType) {
+        } else if (dataType instanceof FloatType) {
             return new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
-        }
-
-        @Override
-        public ArrowType visit(DoubleType doubleType) {
+        } else if (dataType instanceof DoubleType) {
             return new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
-        }
-
-        @Override
-        public ArrowType visit(CharType varCharType) {
+        } else if (dataType instanceof CharType || dataType instanceof StringType) {
             return ArrowType.Utf8.INSTANCE;
-        }
-
-        @Override
-        public ArrowType visit(StringType stringType) {
-            return ArrowType.Utf8.INSTANCE;
-        }
-
-        @Override
-        public ArrowType visit(BinaryType binaryType) {
+        } else if (dataType instanceof BinaryType) {
+            BinaryType binaryType = (BinaryType) dataType;
             return new ArrowType.FixedSizeBinary(binaryType.getLength());
-        }
-
-        @Override
-        public ArrowType visit(BytesType bytesType) {
+        } else if (dataType instanceof BytesType) {
             return ArrowType.Binary.INSTANCE;
-        }
-
-        @Override
-        public ArrowType visit(DecimalType decimalType) {
+        } else if (dataType instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) dataType;
             return ArrowType.Decimal.createDecimal(
                     decimalType.getPrecision(), decimalType.getScale(), null);
-        }
-
-        @Override
-        public ArrowType visit(DateType dateType) {
+        } else if (dataType instanceof DateType) {
             return new ArrowType.Date(DateUnit.DAY);
-        }
-
-        @Override
-        public ArrowType visit(TimeType timeType) {
+        } else if (dataType instanceof TimeType) {
+            TimeType timeType = (TimeType) dataType;
             if (timeType.getPrecision() == 0) {
                 return new ArrowType.Time(TimeUnit.SECOND, 32);
             } else if (timeType.getPrecision() >= 1 && timeType.getPrecision() <= 3) {
@@ -185,25 +168,8 @@ public class LanceArrowUtils {
             } else {
                 return new ArrowType.Time(TimeUnit.NANOSECOND, 64);
             }
-        }
-
-        @Override
-        public ArrowType visit(LocalZonedTimestampType localZonedTimestampType) {
-            if (localZonedTimestampType.getPrecision() == 0) {
-                return new ArrowType.Timestamp(TimeUnit.SECOND, null);
-            } else if (localZonedTimestampType.getPrecision() >= 1
-                    && localZonedTimestampType.getPrecision() <= 3) {
-                return new ArrowType.Timestamp(TimeUnit.MILLISECOND, null);
-            } else if (localZonedTimestampType.getPrecision() >= 4
-                    && localZonedTimestampType.getPrecision() <= 6) {
-                return new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
-            } else {
-                return new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
-            }
-        }
-
-        @Override
-        public ArrowType visit(TimestampType timestampType) {
+        } else if (dataType instanceof LocalZonedTimestampType) {
+            LocalZonedTimestampType timestampType = (LocalZonedTimestampType) dataType;
             if (timestampType.getPrecision() == 0) {
                 return new ArrowType.Timestamp(TimeUnit.SECOND, null);
             } else if (timestampType.getPrecision() >= 1 && timestampType.getPrecision() <= 3) {
@@ -213,66 +179,23 @@ public class LanceArrowUtils {
             } else {
                 return new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
             }
-        }
-
-        @Override
-        protected ArrowType defaultMethod(DataType dataType) {
+        } else if (dataType instanceof TimestampType) {
+            TimestampType timestampType = (TimestampType) dataType;
+            if (timestampType.getPrecision() == 0) {
+                return new ArrowType.Timestamp(TimeUnit.SECOND, null);
+            } else if (timestampType.getPrecision() >= 1 && timestampType.getPrecision() <= 3) {
+                return new ArrowType.Timestamp(TimeUnit.MILLISECOND, null);
+            } else if (timestampType.getPrecision() >= 4 && timestampType.getPrecision() <= 6) {
+                return new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
+            } else {
+                return new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
+            }
+        } else if (dataType instanceof ArrayType) {
+            return ArrowType.List.INSTANCE;
+        } else {
             throw new UnsupportedOperationException(
                     String.format(
                             "Unsupported data type %s currently.", dataType.asSummaryString()));
-        }
-    }
-
-    private static int getPrecision(DecimalVector decimalVector) {
-        return decimalVector.getPrecision();
-    }
-
-    public static ArrowFieldWriter<InternalRow> createArrowFieldWriter(
-            ValueVector vector, DataType dataType) {
-        if (vector instanceof TinyIntVector) {
-            return ArrowTinyIntWriter.forField((TinyIntVector) vector);
-        } else if (vector instanceof SmallIntVector) {
-            return ArrowSmallIntWriter.forField((SmallIntVector) vector);
-        } else if (vector instanceof IntVector) {
-            return ArrowIntWriter.forField((IntVector) vector);
-        } else if (vector instanceof BigIntVector) {
-            return ArrowBigIntWriter.forField((BigIntVector) vector);
-        } else if (vector instanceof BitVector) {
-            return ArrowBooleanWriter.forField((BitVector) vector);
-        } else if (vector instanceof Float4Vector) {
-            return ArrowFloatWriter.forField((Float4Vector) vector);
-        } else if (vector instanceof Float8Vector) {
-            return ArrowDoubleWriter.forField((Float8Vector) vector);
-        } else if (vector instanceof VarCharVector) {
-            return ArrowVarCharWriter.forField((VarCharVector) vector);
-        } else if (vector instanceof FixedSizeBinaryVector) {
-            return ArrowBinaryWriter.forField((FixedSizeBinaryVector) vector);
-        } else if (vector instanceof VarBinaryVector) {
-            return ArrowVarBinaryWriter.forField((VarBinaryVector) vector);
-        } else if (vector instanceof DecimalVector) {
-            DecimalVector decimalVector = (DecimalVector) vector;
-            return ArrowDecimalWriter.forField(
-                    decimalVector, getPrecision(decimalVector), decimalVector.getScale());
-        } else if (vector instanceof DateDayVector) {
-            return ArrowDateWriter.forField((DateDayVector) vector);
-        } else if (vector instanceof TimeSecVector
-                || vector instanceof TimeMilliVector
-                || vector instanceof TimeMicroVector
-                || vector instanceof TimeNanoVector) {
-            return ArrowTimeWriter.forField(vector);
-        } else if (vector instanceof TimeStampVector
-                && ((ArrowType.Timestamp) vector.getField().getType()).getTimezone() == null) {
-            int precision;
-            if (dataType instanceof LocalZonedTimestampType) {
-                precision = ((LocalZonedTimestampType) dataType).getPrecision();
-                return ArrowTimestampLtzWriter.forField(vector, precision);
-            } else {
-                precision = ((TimestampType) dataType).getPrecision();
-                return ArrowTimestampNtzWriter.forField(vector, precision);
-            }
-        } else {
-            throw new UnsupportedOperationException(
-                    String.format("Unsupported type %s.", dataType));
         }
     }
 }

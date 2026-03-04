@@ -22,16 +22,15 @@ import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.table.getter.PartitionGetter;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.decode.RowDecoder;
 import org.apache.fluss.row.encode.KeyEncoder;
-import org.apache.fluss.row.encode.ValueDecoder;
-import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.NotThreadSafe;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
@@ -40,13 +39,8 @@ import static org.apache.fluss.client.utils.ClientUtils.getPartitionId;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** An implementation of {@link Lookuper} that lookups by primary key. */
-class PrimaryKeyLookuper implements Lookuper {
-
-    private final TableInfo tableInfo;
-
-    private final MetadataUpdater metadataUpdater;
-
-    private final LookupClient lookupClient;
+@NotThreadSafe
+class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
 
     private final KeyEncoder primaryKeyEncoder;
 
@@ -58,46 +52,46 @@ class PrimaryKeyLookuper implements Lookuper {
 
     private final BucketingFunction bucketingFunction;
     private final int numBuckets;
+    private final boolean insertIfNotExists;
 
     /** a getter to extract partition from lookup key row, null when it's not a partitioned. */
     private @Nullable final PartitionGetter partitionGetter;
 
-    /** Decode the lookup bytes to result row. */
-    private final ValueDecoder kvValueDecoder;
-
     public PrimaryKeyLookuper(
-            TableInfo tableInfo, MetadataUpdater metadataUpdater, LookupClient lookupClient) {
+            TableInfo tableInfo,
+            SchemaGetter schemaGetter,
+            MetadataUpdater metadataUpdater,
+            LookupClient lookupClient,
+            boolean insertIfNotExists) {
+        super(tableInfo, metadataUpdater, lookupClient, schemaGetter);
         checkArgument(
                 tableInfo.hasPrimaryKey(),
                 "Log table %s doesn't support lookup",
                 tableInfo.getTablePath());
-        this.tableInfo = tableInfo;
         this.numBuckets = tableInfo.getNumBuckets();
-        this.metadataUpdater = metadataUpdater;
-        this.lookupClient = lookupClient;
+        this.insertIfNotExists = insertIfNotExists;
 
         // the row type of the input lookup row
         RowType lookupRowType = tableInfo.getRowType().project(tableInfo.getPrimaryKeys());
         DataLakeFormat lakeFormat = tableInfo.getTableConfig().getDataLakeFormat().orElse(null);
-
-        // the encoded primary key is the physical primary key
         this.primaryKeyEncoder =
-                KeyEncoder.of(lookupRowType, tableInfo.getPhysicalPrimaryKeys(), lakeFormat);
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        lookupRowType,
+                        tableInfo.getPhysicalPrimaryKeys(),
+                        tableInfo.getTableConfig(),
+                        tableInfo.isDefaultBucketKey());
         this.bucketKeyEncoder =
                 tableInfo.isDefaultBucketKey()
                         ? primaryKeyEncoder
-                        : KeyEncoder.of(lookupRowType, tableInfo.getBucketKeys(), lakeFormat);
+                        : KeyEncoder.ofBucketKeyEncoder(
+                                lookupRowType, tableInfo.getBucketKeys(), lakeFormat);
+
         this.bucketingFunction = BucketingFunction.of(lakeFormat);
 
         this.partitionGetter =
                 tableInfo.isPartitioned()
                         ? new PartitionGetter(lookupRowType, tableInfo.getPartitionKeys())
                         : null;
-        this.kvValueDecoder =
-                new ValueDecoder(
-                        RowDecoder.create(
-                                tableInfo.getTableConfig().getKvFormat(),
-                                tableInfo.getRowType().getChildren().toArray(new DataType[0])));
     }
 
     @Override
@@ -125,15 +119,21 @@ class PrimaryKeyLookuper implements Lookuper {
 
         int bucketId = bucketingFunction.bucketing(bkBytes, numBuckets);
         TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-        return lookupClient
-                .lookup(tableBucket, pkBytes)
-                .thenApply(
-                        valueBytes -> {
-                            InternalRow row =
-                                    valueBytes == null
-                                            ? null
-                                            : kvValueDecoder.decodeValue(valueBytes).row;
-                            return new LookupResult(row);
+        CompletableFuture<LookupResult> lookupFuture = new CompletableFuture<>();
+        lookupClient
+                .lookup(tableInfo.getTablePath(), tableBucket, pkBytes, insertIfNotExists)
+                .whenComplete(
+                        (result, error) -> {
+                            if (error != null) {
+                                lookupFuture.completeExceptionally(error);
+                            } else {
+                                handleLookupResponse(
+                                        result == null
+                                                ? Collections.emptyList()
+                                                : Collections.singletonList(result),
+                                        lookupFuture);
+                            }
                         });
+        return lookupFuture;
     }
 }

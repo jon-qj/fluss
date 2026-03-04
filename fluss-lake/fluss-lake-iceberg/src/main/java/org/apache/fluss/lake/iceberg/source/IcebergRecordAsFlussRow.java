@@ -20,6 +20,8 @@ package org.apache.fluss.lake.iceberg.source;
 
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.Decimal;
+import org.apache.fluss.row.InternalArray;
+import org.apache.fluss.row.InternalMap;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
@@ -29,8 +31,12 @@ import org.apache.iceberg.data.Record;
 
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Map;
 
 import static org.apache.fluss.lake.iceberg.IcebergLakeCatalog.SYSTEM_COLUMNS;
 
@@ -40,6 +46,10 @@ public class IcebergRecordAsFlussRow implements InternalRow {
     private Record icebergRecord;
 
     public IcebergRecordAsFlussRow() {}
+
+    public IcebergRecordAsFlussRow(Record icebergRecord) {
+        this.icebergRecord = icebergRecord;
+    }
 
     public IcebergRecordAsFlussRow replaceIcebergRecord(Record icebergRecord) {
         this.icebergRecord = icebergRecord;
@@ -78,6 +88,14 @@ public class IcebergRecordAsFlussRow implements InternalRow {
     @Override
     public int getInt(int pos) {
         Object value = icebergRecord.get(pos);
+        // Iceberg returns LocalDate for DATE columns and LocalTime for TIME columns,
+        // but Fluss InternalRow uses getInt() for both (epoch days and millis-of-day).
+        if (value instanceof LocalDate) {
+            return (int) ((LocalDate) value).toEpochDay();
+        }
+        if (value instanceof LocalTime) {
+            return (int) ((LocalTime) value).toNanoOfDay() / 1_000_000;
+        }
         return (Integer) value;
     }
 
@@ -146,5 +164,42 @@ public class IcebergRecordAsFlussRow implements InternalRow {
         Object value = icebergRecord.get(pos);
         ByteBuffer byteBuffer = (ByteBuffer) value;
         return BytesUtils.toArray(byteBuffer);
+    }
+
+    @Override
+    public InternalArray getArray(int pos) {
+        Object value = icebergRecord.get(pos);
+        if (value == null) {
+            return null;
+        }
+        List<?> icebergList = (List<?>) value;
+        return new IcebergArrayAsFlussArray(icebergList);
+    }
+
+    @Override
+    public InternalMap getMap(int pos) {
+        Object value = icebergRecord.get(pos);
+        if (value == null) {
+            return null;
+        }
+        Map<?, ?> icebergMap = (Map<?, ?>) value;
+        return new IcebergMapAsFlussMap(icebergMap);
+    }
+
+    @Override
+    public InternalRow getRow(int pos, int numFields) {
+        Object value = icebergRecord.get(pos);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Record) {
+            return new IcebergRecordAsFlussRow((Record) value);
+        } else {
+            throw new IllegalArgumentException(
+                    "Expected Iceberg Record for nested row at position "
+                            + pos
+                            + " but found: "
+                            + value.getClass().getName());
+        }
     }
 }

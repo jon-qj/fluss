@@ -19,6 +19,7 @@ package org.apache.fluss.lake.iceberg.tiering;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.lake.writer.LakeWriter;
@@ -185,7 +186,7 @@ class IcebergTieringTest {
 
         // second, commit data
         try (LakeCommitter<IcebergWriteResult, IcebergCommittable> lakeCommitter =
-                createLakeCommitter(tablePath)) {
+                createLakeCommitter(tablePath, tableInfo)) {
             // serialize/deserialize committable
             IcebergCommittable icebergCommittable =
                     lakeCommitter.toCommittable(icebergWriteResults);
@@ -194,7 +195,9 @@ class IcebergTieringTest {
                     committableSerializer.deserialize(
                             committableSerializer.getVersion(), serialized);
             long snapshot =
-                    lakeCommitter.commit(icebergCommittable, Collections.singletonMap("k1", "v1"));
+                    lakeCommitter
+                            .commit(icebergCommittable, Collections.singletonMap("k1", "v1"))
+                            .getCommittedSnapshotId();
             icebergTable.refresh();
             Snapshot icebergSnapshot = icebergTable.currentSnapshot();
             assertThat(snapshot).isEqualTo(icebergSnapshot.snapshotId());
@@ -246,8 +249,29 @@ class IcebergTieringTest {
     }
 
     private LakeCommitter<IcebergWriteResult, IcebergCommittable> createLakeCommitter(
-            TablePath tablePath) throws IOException {
-        return icebergLakeTieringFactory.createLakeCommitter(() -> tablePath);
+            TablePath tablePath, TableInfo tableInfo) throws IOException {
+        return icebergLakeTieringFactory.createLakeCommitter(
+                new CommitterInitContext() {
+                    @Override
+                    public TablePath tablePath() {
+                        return tablePath;
+                    }
+
+                    @Override
+                    public TableInfo tableInfo() {
+                        return tableInfo;
+                    }
+
+                    @Override
+                    public Configuration lakeTieringConfig() {
+                        return new Configuration();
+                    }
+
+                    @Override
+                    public Configuration flussClientConfig() {
+                        return new Configuration();
+                    }
+                });
     }
 
     private Tuple2<List<LogRecord>, List<LogRecord>> genLogTableRecords(
@@ -330,7 +354,7 @@ class IcebergTieringTest {
     }
 
     private GenericRecord toRecord(long offset, GenericRow row, ChangeType changeType) {
-        return new GenericRecord(offset, System.currentTimeMillis(), changeType, row);
+        return new GenericRecord(offset, 1000000000L + offset, changeType, row);
     }
 
     private void createTable(

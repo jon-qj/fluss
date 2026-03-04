@@ -27,6 +27,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.types.DataTypeRoot;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Identifier;
@@ -41,6 +42,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.apache.fluss.lake.paimon.PaimonLakeCatalog.SYSTEM_COLUMNS;
@@ -57,6 +59,7 @@ public class PaimonConversions {
 
     // for fluss config
     public static final String FLUSS_CONF_PREFIX = "fluss.";
+    public static final String TABLE_DATALAKE_PAIMON_PREFIX = "table.datalake.paimon.";
     // for paimon config
     private static final String PAIMON_CONF_PREFIX = "paimon.";
 
@@ -128,6 +131,31 @@ public class PaimonConversions {
                 schemaChanges.add(
                         SchemaChange.removeOption(
                                 convertFlussPropertyKeyToPaimon(resetOption.getKey())));
+            } else if (tableChange instanceof TableChange.AddColumn) {
+                TableChange.AddColumn addColumn = (TableChange.AddColumn) tableChange;
+
+                if (!(addColumn.getPosition() instanceof TableChange.Last)) {
+                    throw new UnsupportedOperationException(
+                            "Only support to add column at last for paimon table.");
+                }
+
+                org.apache.fluss.types.DataType flussDataType = addColumn.getDataType();
+                if (!flussDataType.isNullable()) {
+                    throw new UnsupportedOperationException(
+                            "Only support to add nullable column for paimon table.");
+                }
+
+                org.apache.paimon.types.DataType paimonDataType =
+                        flussDataType.accept(FlussDataTypeToPaimonDataType.INSTANCE);
+
+                String firstSystemColumnName = SYSTEM_COLUMNS.keySet().iterator().next();
+                schemaChanges.add(
+                        SchemaChange.addColumn(
+                                addColumn.getName(),
+                                paimonDataType,
+                                addColumn.getComment(),
+                                SchemaChange.Move.before(
+                                        addColumn.getName(), firstSystemColumnName)));
             } else {
                 throw new UnsupportedOperationException(
                         "Unsupported table change: " + tableChange.getClass());
@@ -194,6 +222,7 @@ public class PaimonConversions {
                     CoreOptions.CHANGELOG_PRODUCER.key(),
                     CoreOptions.ChangelogProducer.INPUT.toString());
         }
+
         // set partition keys
         schemaBuilder.partitionKeys(tableDescriptor.getPartitionKeys());
 
@@ -203,6 +232,29 @@ public class PaimonConversions {
                 .getCustomProperties()
                 .forEach((k, v) -> setFlussPropertyToPaimon(k, v, options));
         schemaBuilder.options(options.toMap());
+
+        // currently we only support string type, todo
+        // consider to support other types
+        if (options.get(CoreOptions.DELETION_VECTORS_ENABLED)) {
+            org.apache.fluss.types.RowType rowType = tableDescriptor.getSchema().getRowType();
+            Optional<String> invalidKey =
+                    tableDescriptor.getPartitionKeys().stream()
+                            .filter(
+                                    key ->
+                                            rowType.getField(key).getType().getTypeRoot()
+                                                    != DataTypeRoot.STRING)
+                            .findFirst();
+            if (invalidKey.isPresent()) {
+                throw new UnsupportedOperationException(
+                        String.format(
+                                "Only support String type as partitioned key when 'deletion-vectors.enabled' is set to true for paimon, found '%s' is not String type.",
+                                invalidKey.get()));
+            }
+        }
+
+        // set comment
+        tableDescriptor.getComment().ifPresent(schemaBuilder::comment);
+
         return schemaBuilder.build();
     }
 
@@ -232,7 +284,7 @@ public class PaimonConversions {
     private static void setFlussPropertyToPaimon(String key, String value, Options options) {
         if (key.startsWith(PAIMON_CONF_PREFIX)) {
             options.set(key.substring(PAIMON_CONF_PREFIX.length()), value);
-        } else {
+        } else if (!key.startsWith(TABLE_DATALAKE_PAIMON_PREFIX)) {
             options.set(FLUSS_CONF_PREFIX + key, value);
         }
     }

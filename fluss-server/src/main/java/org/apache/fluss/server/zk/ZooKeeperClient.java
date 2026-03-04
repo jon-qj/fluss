@@ -18,8 +18,10 @@
 package org.apache.fluss.server.zk;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.Schema;
@@ -33,18 +35,21 @@ import org.apache.fluss.security.acl.ResourceType;
 import org.apache.fluss.server.authorizer.DefaultAuthorizer.VersionedAcls;
 import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
 import org.apache.fluss.server.metadata.BucketMetadata;
+import org.apache.fluss.server.zk.ZkAsyncRequest.ZkCheckExistsRequest;
 import org.apache.fluss.server.zk.ZkAsyncRequest.ZkGetChildrenRequest;
 import org.apache.fluss.server.zk.ZkAsyncRequest.ZkGetDataRequest;
+import org.apache.fluss.server.zk.ZkAsyncResponse.ZkCheckExistsResponse;
 import org.apache.fluss.server.zk.ZkAsyncResponse.ZkGetChildrenResponse;
 import org.apache.fluss.server.zk.ZkAsyncResponse.ZkGetDataResponse;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
 import org.apache.fluss.server.zk.data.DatabaseRegistration;
-import org.apache.fluss.server.zk.data.LakeTableSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ResourceAcl;
+import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
@@ -58,22 +63,32 @@ import org.apache.fluss.server.zk.data.ZkData.ConfigEntityZNode;
 import org.apache.fluss.server.zk.data.ZkData.CoordinatorZNode;
 import org.apache.fluss.server.zk.data.ZkData.DatabaseZNode;
 import org.apache.fluss.server.zk.data.ZkData.DatabasesZNode;
+import org.apache.fluss.server.zk.data.ZkData.KvSnapshotLeaseZNode;
+import org.apache.fluss.server.zk.data.ZkData.KvSnapshotLeasesZNode;
 import org.apache.fluss.server.zk.data.ZkData.LakeTableZNode;
 import org.apache.fluss.server.zk.data.ZkData.LeaderAndIsrZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionSequenceIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionsZNode;
+import org.apache.fluss.server.zk.data.ZkData.ProducerIdZNode;
+import org.apache.fluss.server.zk.data.ZkData.ProducersZNode;
+import org.apache.fluss.server.zk.data.ZkData.RebalanceZNode;
 import org.apache.fluss.server.zk.data.ZkData.ResourceAclNode;
 import org.apache.fluss.server.zk.data.ZkData.SchemaZNode;
 import org.apache.fluss.server.zk.data.ZkData.SchemasZNode;
 import org.apache.fluss.server.zk.data.ZkData.ServerIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.ServerIdsZNode;
+import org.apache.fluss.server.zk.data.ZkData.ServerTagsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableSequenceIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableZNode;
 import org.apache.fluss.server.zk.data.ZkData.TablesZNode;
 import org.apache.fluss.server.zk.data.ZkData.WriterIdZNode;
+import org.apache.fluss.server.zk.data.lake.LakeTable;
+import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFramework;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.BackgroundCallback;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.CuratorEvent;
@@ -133,6 +148,7 @@ public class ZooKeeperClient implements AutoCloseable {
     private final ZkSequenceIDCounter writerIdCounter;
 
     private final Semaphore inFlightRequests;
+    private final Configuration configuration;
 
     public ZooKeeperClient(
             CuratorFrameworkWithUnhandledErrorListener curatorFrameworkWrapper,
@@ -147,6 +163,7 @@ public class ZooKeeperClient implements AutoCloseable {
         int maxInFlightRequests =
                 configuration.getInt(ConfigOptions.ZOOKEEPER_MAX_INFLIGHT_REQUESTS);
         this.inFlightRequests = new Semaphore(maxInFlightRequests);
+        this.configuration = configuration;
     }
 
     public Optional<byte[]> getOrEmpty(String path) throws Exception {
@@ -289,7 +306,17 @@ public class ZooKeeperClient implements AutoCloseable {
             throws Exception {
         String path = TableIdZNode.path(tableId);
         zkClient.setData().forPath(path, TableIdZNode.encode(tableAssignment));
-        LOG.info("Updated table assignment {} for table id {}.", tableAssignment, tableId);
+        LOG.debug("Updated table assignment {} for table id {}.", tableAssignment, tableId);
+    }
+
+    public void updatePartitionAssignment(long partitionId, PartitionAssignment partitionAssignment)
+            throws Exception {
+        String path = PartitionIdZNode.path(partitionId);
+        zkClient.setData().forPath(path, PartitionIdZNode.encode(partitionAssignment));
+        LOG.debug(
+                "Updated partition assignment {} for partition id {}.",
+                partitionAssignment,
+                partitionId);
     }
 
     public void deleteTableAssignment(long tableId) throws Exception {
@@ -466,6 +493,36 @@ public class ZooKeeperClient implements AutoCloseable {
         return getChildren(DatabasesZNode.path());
     }
 
+    public List<DatabaseSummary> listDatabaseSummaries(Collection<String> databaseNames)
+            throws Exception {
+        Map<String, String> path2DatabaseNamesMap =
+                databaseNames.stream()
+                        .collect(toMap(DatabaseZNode::path, databaseName -> databaseName));
+        List<ZkCheckExistsResponse> statsInBackground =
+                getStatInBackground(path2DatabaseNamesMap.keySet());
+        List<DatabaseSummary> databaseSummaries = new ArrayList<>();
+        for (ZkCheckExistsResponse response : statsInBackground) {
+            Stat stat = response.getStat();
+            if (!response.hasError() && stat != null) {
+                // To decrease the cost, use zk node creation time as the database creation
+                // time rather than create_time in node data.
+                databaseSummaries.add(
+                        new DatabaseSummary(
+                                path2DatabaseNamesMap.get(response.getPath()),
+                                response.getStat().getCtime(),
+                                response.getStat().getNumChildren()));
+            } else {
+                // silently ignore the database which does not exist anymore,
+                // because the database names are listed by server not user
+                LOG.warn(
+                        "Failed to get database summary for database {}. {}",
+                        path2DatabaseNamesMap.get(response.getPath()),
+                        response.getErrorMessage());
+            }
+        }
+        return databaseSummaries;
+    }
+
     public List<String> listTables(String databaseName) throws Exception {
         return getChildren(TablesZNode.path(databaseName));
     }
@@ -536,18 +593,46 @@ public class ZooKeeperClient implements AutoCloseable {
                 "tables registration");
     }
 
-    /** Get the v1 schema for given tables in ZK. */
-    public Map<TablePath, SchemaInfo> getV1Schemas(Collection<TablePath> tablePaths)
+    /** Get the latest schema for given tables in ZK. */
+    public Map<TablePath, SchemaInfo> getLatestSchemas(Collection<TablePath> tablePaths)
             throws Exception {
-        Map<String, TablePath> path2TablePathMap =
-                tablePaths.stream()
-                        .collect(toMap(p -> SchemaZNode.path(p, DEFAULT_SCHEMA_ID), path -> path));
+        Map<String, TablePath> schemaChildren2TablePathMap =
+                tablePaths.stream().collect(toMap(SchemasZNode::path, path -> path));
+        List<ZkGetChildrenResponse> childrenResponses =
+                getChildrenInBackground(schemaChildren2TablePathMap.keySet());
+        // get the schema ids for each table
+        Map<TablePath, List<String>> schemaIdsForTables =
+                processGetChildrenResponses(
+                        childrenResponses,
+                        response -> schemaChildren2TablePathMap.get(response.getPath()),
+                        "schema children for tables");
+
+        // get the schema info for each latest schema id
+        Map<TablePath, Integer> latestSchemaIdMap = new HashMap<>();
+        Map<String, TablePath> path2TablePathMap = new HashMap<>();
+        schemaIdsForTables.forEach(
+                (tp, schemaIds) -> {
+                    int latestSchemaId =
+                            schemaIds.stream().map(Integer::parseInt).reduce(Math::max).orElse(0);
+                    latestSchemaIdMap.put(tp, latestSchemaId);
+                    path2TablePathMap.put(SchemaZNode.path(tp, latestSchemaId), tp);
+                });
+
         List<ZkGetDataResponse> responses = getDataInBackground(path2TablePathMap.keySet());
-        return processGetDataResponses(
-                responses,
-                resp -> path2TablePathMap.get(resp.getPath()),
-                b -> new SchemaInfo(SchemaZNode.decode(b), DEFAULT_SCHEMA_ID),
-                "schema");
+        Map<TablePath, Schema> schemasForTables =
+                processGetDataResponses(
+                        responses,
+                        resp -> path2TablePathMap.get(resp.getPath()),
+                        SchemaZNode::decode,
+                        "schema");
+
+        Map<TablePath, SchemaInfo> result = new HashMap<>();
+        schemasForTables.forEach(
+                (tp, schema) -> {
+                    int schemaId = latestSchemaIdMap.get(tp);
+                    result.put(tp, new SchemaInfo(schema, schemaId));
+                });
+        return result;
     }
 
     /** Update the table in ZK. */
@@ -809,17 +894,19 @@ public class ZooKeeperClient implements AutoCloseable {
     // --------------------------------------------------------------------------------------------
 
     /** Register schema to ZK metadata and return the schema id. */
-    public int registerSchema(TablePath tablePath, Schema schema) throws Exception {
-        int currentSchemaId = getCurrentSchemaId(tablePath);
+    public int registerFirstSchema(TablePath tablePath, Schema schema) throws Exception {
+        return registerSchema(tablePath, schema, DEFAULT_SCHEMA_ID);
+    }
+
+    public int registerSchema(TablePath tablePath, Schema schema, int schemaId) throws Exception {
         // increase schema id.
-        currentSchemaId++;
-        String path = SchemaZNode.path(tablePath, currentSchemaId);
+        String path = SchemaZNode.path(tablePath, schemaId);
         zkClient.create()
                 .creatingParentsIfNeeded()
                 .withMode(CreateMode.PERSISTENT)
                 .forPath(path, SchemaZNode.encode(schema));
-        LOG.info("Registered new schema version {} for table {}.", currentSchemaId, tablePath);
-        return currentSchemaId;
+        LOG.info("Registered new schema version {} for table {}.", schemaId, tablePath);
+        return schemaId;
     }
 
     /** Get the specific schema by schema id in ZK metadata. */
@@ -955,6 +1042,36 @@ public class ZooKeeperClient implements AutoCloseable {
         return snapshots;
     }
 
+    public List<String> getKvSnapshotLeasesList() throws Exception {
+        return getChildren(KvSnapshotLeasesZNode.path());
+    }
+
+    public void registerKvSnapshotLeaseMetadata(
+            String leaseId, KvSnapshotLeaseMetadata leaseMetadata) throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, KvSnapshotLeaseZNode.encode(leaseMetadata));
+    }
+
+    public void updateKvSnapshotLeaseMetadata(String leaseId, KvSnapshotLeaseMetadata leaseMetadata)
+            throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        zkClient.setData().forPath(path, KvSnapshotLeaseZNode.encode(leaseMetadata));
+    }
+
+    public Optional<KvSnapshotLeaseMetadata> getKvSnapshotLeaseMetadata(String leaseId)
+            throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        return getOrEmpty(path).map(KvSnapshotLeaseZNode::decode);
+    }
+
+    public void deleteKvSnapshotLease(String leaseId) throws Exception {
+        String path = KvSnapshotLeaseZNode.path(leaseId);
+        zkClient.delete().forPath(path);
+    }
+
     // --------------------------------------------------------------------------------------------
     // Writer
     // --------------------------------------------------------------------------------------------
@@ -993,55 +1110,73 @@ public class ZooKeeperClient implements AutoCloseable {
         return getOrEmpty(path).map(BucketRemoteLogsZNode::decode);
     }
 
-    public void upsertLakeTableSnapshot(long tableId, LakeTableSnapshot lakeTableSnapshot)
+    /** Upsert the {@link LakeTable} to Zk Node. */
+    public void upsertLakeTable(long tableId, LakeTable lakeTable, boolean isUpdate)
             throws Exception {
-        String path = LakeTableZNode.path(tableId);
-        Optional<LakeTableSnapshot> optLakeTableSnapshot = getLakeTableSnapshot(tableId);
-        if (optLakeTableSnapshot.isPresent()) {
-            // we need to merge current lake table snapshot with previous
-            // since the current lake table snapshot request won't carry all
-            // the bucket for the table. It will only carry the bucket that is written
-            // after the previous commit
-            LakeTableSnapshot previous = optLakeTableSnapshot.get();
-
-            // merge log startup offset, current will override the previous
-            Map<TableBucket, Long> bucketLogStartOffset =
-                    new HashMap<>(previous.getBucketLogStartOffset());
-            bucketLogStartOffset.putAll(lakeTableSnapshot.getBucketLogStartOffset());
-
-            // merge log end offsets, current will override the previous
-            Map<TableBucket, Long> bucketLogEndOffset =
-                    new HashMap<>(previous.getBucketLogEndOffset());
-            bucketLogEndOffset.putAll(lakeTableSnapshot.getBucketLogEndOffset());
-
-            // merge max timestamp, current will override the previous
-            Map<TableBucket, Long> bucketMaxTimestamp =
-                    new HashMap<>(previous.getBucketMaxTimestamp());
-            bucketMaxTimestamp.putAll(lakeTableSnapshot.getBucketMaxTimestamp());
-
-            Map<Long, String> partitionNameById =
-                    new HashMap<>(previous.getPartitionNameIdByPartitionId());
-            partitionNameById.putAll(lakeTableSnapshot.getPartitionNameIdByPartitionId());
-
-            lakeTableSnapshot =
-                    new LakeTableSnapshot(
-                            lakeTableSnapshot.getSnapshotId(),
-                            lakeTableSnapshot.getTableId(),
-                            bucketLogStartOffset,
-                            bucketLogEndOffset,
-                            bucketMaxTimestamp,
-                            partitionNameById);
-            zkClient.setData().forPath(path, LakeTableZNode.encode(lakeTableSnapshot));
+        byte[] zkData = LakeTableZNode.encode(lakeTable);
+        String zkPath = LakeTableZNode.path(tableId);
+        if (isUpdate) {
+            zkClient.setData().forPath(zkPath, zkData);
         } else {
-            zkClient.create()
-                    .creatingParentsIfNeeded()
-                    .forPath(path, LakeTableZNode.encode(lakeTableSnapshot));
+            zkClient.create().creatingParentsIfNeeded().forPath(zkPath, zkData);
         }
     }
 
-    public Optional<LakeTableSnapshot> getLakeTableSnapshot(long tableId) throws Exception {
-        String path = LakeTableZNode.path(tableId);
-        return getOrEmpty(path).map(LakeTableZNode::decode);
+    /**
+     * Gets the {@link LakeTable} for the given table ID.
+     *
+     * @param tableId the table ID
+     * @return an Optional containing the LakeTable if it exists, empty otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<LakeTable> getLakeTable(long tableId) throws Exception {
+        String zkPath = LakeTableZNode.path(tableId);
+        return getOrEmpty(zkPath).map(LakeTableZNode::decode);
+    }
+
+    /**
+     * Gets the {@link LakeTableSnapshot} for the given table ID.
+     *
+     * @param tableId the table ID
+     * @param snapshotId the snapshot id for the snapshot to get, null means to get latest snapshot
+     *     id
+     * @return an Optional containing the LakeTableSnapshot if the table exists, empty otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<LakeTableSnapshot> getLakeTableSnapshot(long tableId, @Nullable Long snapshotId)
+            throws Exception {
+        Optional<LakeTable> optLakeTable = getLakeTable(tableId);
+        if (optLakeTable.isPresent()) {
+            // always get the latest snapshot
+            if (snapshotId == null) {
+                return Optional.ofNullable(optLakeTable.get().getOrReadLatestTableSnapshot());
+            } else {
+                return Optional.ofNullable(optLakeTable.get().getOrReadTableSnapshot(snapshotId));
+            }
+
+        } else {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Gets the latest readable {@link LakeTableSnapshot} for the given table ID.
+     *
+     * @param tableId the table ID
+     * @return an Optional containing the latest readable LakeTableSnapshot if found, empty
+     *     otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<LakeTableSnapshot> getLatestReadableLakeTableSnapshot(long tableId)
+            throws Exception {
+        Optional<LakeTable> optLakeTable = getLakeTable(tableId);
+        if (optLakeTable.isPresent()) {
+            LakeTableSnapshot readableSnapshot =
+                    optLakeTable.get().getOrReadLatestReadableTableSnapshot();
+            return Optional.ofNullable(readableSnapshot);
+        } else {
+            return Optional.empty();
+        }
     }
 
     /**
@@ -1130,7 +1265,7 @@ public class ZooKeeperClient implements AutoCloseable {
                 .forPath(
                         AclChangeNotificationNode.pathPrefix(),
                         AclChangeNotificationNode.encode(resource));
-        LOG.info("add acl change notification for resource {}  ", resource);
+        LOG.info("addColumn acl change notification for resource {}  ", resource);
     }
 
     public Map<String, String> fetchEntityConfig() throws Exception {
@@ -1163,6 +1298,56 @@ public class ZooKeeperClient implements AutoCloseable {
                 .forPath(
                         ZkData.ConfigEntityChangeNotificationSequenceZNode.pathPrefix(),
                         ZkData.ConfigEntityChangeNotificationSequenceZNode.encode());
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Maintenance
+    // --------------------------------------------------------------------------------------------
+
+    public void registerServerTags(ServerTags newServerTags) throws Exception {
+        String path = ServerTagsZNode.path();
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.PERSISTENT)
+                .forPath(path, ServerTagsZNode.encode(newServerTags));
+    }
+
+    public void updateServerTags(ServerTags newServerTags) throws Exception {
+        String path = ServerTagsZNode.path();
+        zkClient.setData().forPath(path, ServerTagsZNode.encode(newServerTags));
+    }
+
+    public Optional<ServerTags> getServerTags() throws Exception {
+        String path = ServerTagsZNode.path();
+        return getOrEmpty(path).map(ServerTagsZNode::decode);
+    }
+
+    public void deleteServerTags() throws Exception {
+        deletePath(ServerTagsZNode.path());
+    }
+
+    public void registerRebalanceTask(RebalanceTask rebalanceTask) throws Exception {
+        String path = RebalanceZNode.path();
+        Stat stat = zkClient.checkExists().forPath(path);
+        if (stat == null) {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(path, RebalanceZNode.encode(rebalanceTask));
+        } else {
+            zkClient.setData().forPath(path, RebalanceZNode.encode(rebalanceTask));
+        }
+    }
+
+    public Optional<RebalanceTask> getRebalanceTask() throws Exception {
+        String path = RebalanceZNode.path();
+        return getOrEmpty(path).map(RebalanceZNode::decode);
+    }
+
+    /** Deletes the rebalance task from ZooKeeper. Only for testing propose now */
+    @VisibleForTesting
+    public void deleteRebalanceTask() throws Exception {
+        deletePath(RebalanceZNode.path());
     }
 
     // --------------------------------------------------------------------------------------------
@@ -1335,7 +1520,8 @@ public class ZooKeeperClient implements AutoCloseable {
 
                     } else if (request instanceof ZkGetChildrenRequest) {
                         zkClient.getChildren().inBackground(callback).forPath(request.getPath());
-
+                    } else if (request instanceof ZkCheckExistsRequest) {
+                        zkClient.checkExists().inBackground(callback).forPath(request.getPath());
                     } else {
                         throw new IllegalArgumentException(
                                 "Unsupported request type: " + request.getClass());
@@ -1405,6 +1591,20 @@ public class ZooKeeperClient implements AutoCloseable {
         List<ZkGetDataRequest> requests =
                 paths.stream().map(ZkGetDataRequest::new).collect(Collectors.toList());
         return handleRequestInBackground(requests, ZkGetDataResponse::create);
+    }
+
+    /**
+     * Gets the stat of given zk node paths in background.
+     *
+     * @param paths the paths to fetch stat
+     * @return list of async responses for each path
+     * @throws Exception if there is an error during the operation
+     */
+    private List<ZkCheckExistsResponse> getStatInBackground(Collection<String> paths)
+            throws Exception {
+        List<ZkCheckExistsRequest> requests =
+                paths.stream().map(ZkCheckExistsRequest::new).collect(Collectors.toList());
+        return handleRequestInBackground(requests, ZkCheckExistsResponse::create);
     }
 
     /**
@@ -1501,5 +1701,136 @@ public class ZooKeeperClient implements AutoCloseable {
             }
         }
         return result;
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Producer Offset Snapshot
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Tries to atomically register a producer offset snapshot to ZK.
+     *
+     * <p>This method leverages ZooKeeper's atomic create operation to ensure that only one
+     * concurrent request can successfully create the snapshot. If a snapshot already exists for the
+     * given producer ID, this method returns false instead of throwing an exception.
+     *
+     * @param producerId the producer ID (typically Flink job ID)
+     * @param producerOffsets the producer offsets containing expiration time and table offset
+     *     metadata
+     * @return true if the snapshot was created successfully, false if a snapshot already exists
+     * @throws Exception if the operation fails for reasons other than node already existing
+     */
+    public boolean tryRegisterProducerOffsets(String producerId, ProducerOffsets producerOffsets)
+            throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        try {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(path, ProducerIdZNode.encode(producerOffsets));
+            LOG.info("Registered producer snapshot for producer {} at path {}.", producerId, path);
+            return true;
+        } catch (KeeperException.NodeExistsException e) {
+            LOG.debug(
+                    "Producer snapshot already exists for producer {} at path {}, "
+                            + "returning false.",
+                    producerId,
+                    path);
+            return false;
+        }
+    }
+
+    /**
+     * Gets the {@link ProducerOffsets} for the given producer ID.
+     *
+     * @param producerId the producer ID
+     * @return an Optional containing the ProducerOffsets if it exists, empty otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<ProducerOffsets> getProducerOffsets(String producerId) throws Exception {
+        String zkPath = ProducerIdZNode.path(producerId);
+        return getOrEmpty(zkPath).map(ProducerIdZNode::decode);
+    }
+
+    /**
+     * Deletes the producer offset snapshot for the given producer ID.
+     *
+     * @param producerId the producer ID
+     * @throws Exception if the operation fails
+     */
+    public void deleteProducerOffsets(String producerId) throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        zkClient.delete().forPath(path);
+        LOG.info("Deleted producer offsets snapshot for producer {} at path {}.", producerId, path);
+    }
+
+    /**
+     * Gets the {@link ProducerOffsets} for the given producer ID along with its ZK version.
+     *
+     * <p>The version can be used for conditional updates/deletes to handle concurrent modifications
+     * safely.
+     *
+     * @param producerId the producer ID
+     * @return an Optional containing a Tuple2 of (ProducerOffsets, version) if it exists, empty
+     *     otherwise
+     * @throws Exception if the operation fails
+     */
+    public Optional<Tuple2<ProducerOffsets, Integer>> getProducerOffsetsWithVersion(
+            String producerId) throws Exception {
+        String zkPath = ProducerIdZNode.path(producerId);
+        try {
+            Stat stat = new Stat();
+            byte[] data = zkClient.getData().storingStatIn(stat).forPath(zkPath);
+            return Optional.of(Tuple2.of(ProducerIdZNode.decode(data), stat.getVersion()));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Deletes the producer offset snapshot for the given producer ID only if the version matches.
+     *
+     * <p>This provides optimistic concurrency control - the delete will only succeed if no other
+     * process has modified the snapshot since it was read.
+     *
+     * @param producerId the producer ID
+     * @param expectedVersion the expected ZK version (obtained from getProducerSnapshotWithVersion)
+     * @return true if deleted successfully, false if version mismatch (snapshot was modified)
+     * @throws Exception if the operation fails for reasons other than version mismatch
+     */
+    public boolean deleteProducerSnapshotIfVersion(String producerId, int expectedVersion)
+            throws Exception {
+        String path = ProducerIdZNode.path(producerId);
+        try {
+            zkClient.delete().withVersion(expectedVersion).forPath(path);
+            LOG.info(
+                    "Deleted producer snapshot for producer {} at path {} with version {}.",
+                    producerId,
+                    path,
+                    expectedVersion);
+            return true;
+        } catch (KeeperException.BadVersionException e) {
+            LOG.debug(
+                    "Failed to delete producer snapshot for producer {} - version mismatch "
+                            + "(expected {}, snapshot was modified by another process).",
+                    producerId,
+                    expectedVersion);
+            return false;
+        } catch (KeeperException.NoNodeException e) {
+            LOG.debug(
+                    "Producer snapshot for producer {} was already deleted by another process.",
+                    producerId);
+            return true; // Already deleted, consider it success
+        }
+    }
+
+    /**
+     * Lists all producer IDs that have registered snapshots.
+     *
+     * @return list of producer IDs
+     * @throws Exception if the operation fails
+     */
+    public List<String> listProducerIds() throws Exception {
+        return getChildren(ProducersZNode.path());
     }
 }

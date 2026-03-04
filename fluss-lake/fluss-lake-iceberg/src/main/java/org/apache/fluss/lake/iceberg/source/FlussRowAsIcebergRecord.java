@@ -17,7 +17,11 @@
 
 package org.apache.fluss.lake.iceberg.source;
 
+import org.apache.fluss.lake.iceberg.FlussDataTypeToIcebergDataType;
+import org.apache.fluss.row.InternalArray;
+import org.apache.fluss.row.InternalMap;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.types.ArrayType;
 import org.apache.fluss.types.BigIntType;
 import org.apache.fluss.types.BinaryType;
 import org.apache.fluss.types.BooleanType;
@@ -30,6 +34,7 @@ import org.apache.fluss.types.DoubleType;
 import org.apache.fluss.types.FloatType;
 import org.apache.fluss.types.IntType;
 import org.apache.fluss.types.LocalZonedTimestampType;
+import org.apache.fluss.types.MapType;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.types.SmallIntType;
 import org.apache.fluss.types.StringType;
@@ -169,6 +174,32 @@ public class FlussRowAsIcebergRecord implements Record {
             return row -> DateTimeUtils.toLocalDate(row.getInt(pos));
         } else if (flussType instanceof TimeType) {
             return row -> DateTimeUtils.toLocalTime(row.getInt(pos));
+        } else if (flussType instanceof ArrayType) {
+            ArrayType arrayType = (ArrayType) flussType;
+            return row -> {
+                InternalArray array = row.getArray(pos);
+                return array == null
+                        ? null
+                        : new FlussArrayAsIcebergList(array, arrayType.getElementType());
+            };
+        } else if (flussType instanceof RowType) {
+            RowType rowType = (RowType) flussType;
+            Types.StructType nestedStructType =
+                    (Types.StructType) rowType.accept(FlussDataTypeToIcebergDataType.INSTANCE);
+
+            return row -> {
+                InternalRow nestedRow = row.getRow(pos, rowType.getFieldCount());
+                return new FlussRowAsIcebergRecord(nestedStructType, rowType, nestedRow);
+            };
+        } else if (flussType instanceof MapType) {
+            MapType mapType = (MapType) flussType;
+            return row -> {
+                InternalMap map = row.getMap(pos);
+                return map == null
+                        ? null
+                        : new FlussMapAsIcebergMap(
+                                map, mapType.getKeyType(), mapType.getValueType());
+            };
         } else {
             throw new UnsupportedOperationException(
                     "Unsupported data type conversion for Fluss type: "

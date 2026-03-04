@@ -20,6 +20,7 @@ package org.apache.fluss.lake.lance.tiering;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
+import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.lance.LanceConfig;
 import org.apache.fluss.lake.lance.utils.LanceArrowUtils;
@@ -36,6 +37,7 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.GenericRecord;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.BinaryString;
+import org.apache.fluss.row.GenericArray;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.types.Tuple2;
@@ -45,7 +47,9 @@ import com.lancedb.lance.WriteParams;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -57,18 +61,19 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
-import static org.apache.fluss.flink.tiering.committer.TieringCommitOperator.toBucketOffsetsProperty;
+import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** The UT for tiering to Lance via {@link LanceLakeTieringFactory}. */
 class LanceTieringTest {
+    private static final int EMBEDDING_LIST_SIZE = 4;
+
     private @TempDir File tempWarehouseDir;
     private LanceLakeTieringFactory lanceLakeTieringFactory;
     private Configuration configuration;
@@ -91,13 +96,16 @@ class LanceTieringTest {
         TablePath tablePath = TablePath.of("lance", "logTable");
         Map<String, String> customProperties = new HashMap<>();
         customProperties.put("lance.batch_size", "256");
+        customProperties.put(
+                "embedding" + LanceArrowUtils.FIXED_SIZE_LIST_SIZE_SUFFIX,
+                String.valueOf(EMBEDDING_LIST_SIZE));
         LanceConfig config =
                 LanceConfig.from(
                         configuration.toMap(),
                         customProperties,
                         tablePath.getDatabaseName(),
                         tablePath.getTableName());
-        Schema schema = createTable(config);
+        Schema schema = createTable(config, customProperties);
 
         TableDescriptor descriptor =
                 TableDescriptor.builder()
@@ -115,7 +123,7 @@ class LanceTieringTest {
                 lanceLakeTieringFactory.getCommittableSerializer();
 
         try (LakeCommitter<LanceWriteResult, LanceCommittable> lakeCommitter =
-                createLakeCommitter(tablePath)) {
+                createLakeCommitter(tablePath, tableInfo)) {
             // should no any missing snapshot
             assertThat(lakeCommitter.getMissingLakeSnapshot(2L)).isNull();
         }
@@ -131,8 +139,6 @@ class LanceTieringTest {
                             }
                         }
                         : Collections.singletonMap(null, null);
-        List<String> partitionKeys = isPartitioned ? Arrays.asList("c3") : null;
-        Map<TableBucket, Long> tableBucketOffsets = new HashMap<>();
         // first, write data
         for (int bucket = 0; bucket < bucketNum; bucket++) {
             for (Map.Entry<Long, String> entry : partitionIdAndName.entrySet()) {
@@ -145,7 +151,6 @@ class LanceTieringTest {
                     List<LogRecord> writtenRecords = writeAndExpectRecords.f0;
                     List<LogRecord> expectRecords = writeAndExpectRecords.f1;
                     recordsByBucket.put(partitionBucket, expectRecords);
-                    tableBucketOffsets.put(new TableBucket(0, entry.getKey(), bucket), 10L);
                     for (LogRecord logRecord : writtenRecords) {
                         lakeWriter.write(logRecord);
                     }
@@ -161,18 +166,19 @@ class LanceTieringTest {
 
         // second, commit data
         try (LakeCommitter<LanceWriteResult, LanceCommittable> lakeCommitter =
-                createLakeCommitter(tablePath)) {
+                createLakeCommitter(tablePath, tableInfo)) {
             // serialize/deserialize committable
             LanceCommittable lanceCommittable = lakeCommitter.toCommittable(lanceWriteResults);
             byte[] serialized = committableSerializer.serialize(lanceCommittable);
             lanceCommittable =
                     committableSerializer.deserialize(
                             committableSerializer.getVersion(), serialized);
+            Map<String, String> snapshotProperties =
+                    Collections.singletonMap(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, "offsets");
             long snapshot =
-                    lakeCommitter.commit(
-                            lanceCommittable,
-                            toBucketOffsetsProperty(
-                                    tableBucketOffsets, partitionIdAndName, partitionKeys));
+                    lakeCommitter
+                            .commit(lanceCommittable, snapshotProperties)
+                            .getCommittedSnapshotId();
             // lance dataset version starts from 1
             assertThat(snapshot).isEqualTo(2);
         }
@@ -182,6 +188,13 @@ class LanceTieringTest {
                         new RootAllocator(),
                         config.getDatasetUri(),
                         LanceConfig.genReadOptionFromConfig(config))) {
+            // verify the embedding column uses FixedSizeList in the Lance schema
+            org.apache.arrow.vector.types.pojo.Field embeddingField =
+                    dataset.getSchema().findField("embedding");
+            assertThat(embeddingField.getType()).isInstanceOf(ArrowType.FixedSizeList.class);
+            assertThat(((ArrowType.FixedSizeList) embeddingField.getType()).getListSize())
+                    .isEqualTo(EMBEDDING_LIST_SIZE);
+
             ArrowReader reader = dataset.newScan().scanBatches();
             VectorSchemaRoot readerRoot = reader.getVectorSchemaRoot();
 
@@ -191,8 +204,7 @@ class LanceTieringTest {
                     reader.loadNextBatch();
                     Tuple2<String, Integer> partitionBucket = Tuple2.of(partition, bucket);
                     List<LogRecord> expectRecords = recordsByBucket.get(partitionBucket);
-                    verifyLogTableRecords(
-                            readerRoot, expectRecords, bucket, isPartitioned, partition);
+                    verifyLogTableRecords(readerRoot, expectRecords);
                 }
             }
             assertThat(reader.loadNextBatch()).isFalse();
@@ -200,17 +212,10 @@ class LanceTieringTest {
 
         // then, let's verify getMissingLakeSnapshot works
         try (LakeCommitter<LanceWriteResult, LanceCommittable> lakeCommitter =
-                createLakeCommitter(tablePath)) {
+                createLakeCommitter(tablePath, tableInfo)) {
             // use snapshot id 1 as the known snapshot id
             CommittedLakeSnapshot committedLakeSnapshot = lakeCommitter.getMissingLakeSnapshot(1L);
             assertThat(committedLakeSnapshot).isNotNull();
-            Map<Tuple2<Long, Integer>, Long> offsets = committedLakeSnapshot.getLogEndOffsets();
-            for (int bucket = 0; bucket < 3; bucket++) {
-                for (Long partitionId : partitionIdAndName.keySet()) {
-                    // we only write 10 records, so expected log offset should be 10
-                    assertThat(offsets.get(Tuple2.of(partitionId, bucket))).isEqualTo(10);
-                }
-            }
             assertThat(committedLakeSnapshot.getLakeSnapshotId()).isEqualTo(2L);
 
             // use null as the known snapshot id
@@ -225,14 +230,13 @@ class LanceTieringTest {
         }
     }
 
-    private void verifyLogTableRecords(
-            VectorSchemaRoot root,
-            List<LogRecord> expectRecords,
-            int expectBucket,
-            boolean isPartitioned,
-            @Nullable String partition)
-            throws Exception {
+    private void verifyLogTableRecords(VectorSchemaRoot root, List<LogRecord> expectRecords) {
         assertThat(root.getRowCount()).isEqualTo(expectRecords.size());
+
+        // verify the embedding vector is a FixedSizeListVector
+        assertThat(root.getVector("embedding")).isInstanceOf(FixedSizeListVector.class);
+        FixedSizeListVector embeddingVector = (FixedSizeListVector) root.getVector("embedding");
+
         for (int i = 0; i < expectRecords.size(); i++) {
             LogRecord expectRecord = expectRecords.get(i);
             // check business columns:
@@ -242,12 +246,40 @@ class LanceTieringTest {
                     .isEqualTo(expectRecord.getRow().getString(1).toString());
             assertThat(((VarCharVector) root.getVector(2)).getObject(i).toString())
                     .isEqualTo(expectRecord.getRow().getString(2).toString());
+            // check embedding column
+            java.util.List<?> embeddingValues = embeddingVector.getObject(i);
+            assertThat(embeddingValues).hasSize(EMBEDDING_LIST_SIZE);
+            org.apache.fluss.row.InternalArray expectedArray = expectRecord.getRow().getArray(3);
+            for (int j = 0; j < EMBEDDING_LIST_SIZE; j++) {
+                assertThat((Float) embeddingValues.get(j)).isEqualTo(expectedArray.getFloat(j));
+            }
         }
     }
 
     private LakeCommitter<LanceWriteResult, LanceCommittable> createLakeCommitter(
-            TablePath tablePath) throws IOException {
-        return lanceLakeTieringFactory.createLakeCommitter(() -> tablePath);
+            TablePath tablePath, TableInfo tableInfo) throws IOException {
+        return lanceLakeTieringFactory.createLakeCommitter(
+                new CommitterInitContext() {
+                    @Override
+                    public TablePath tablePath() {
+                        return tablePath;
+                    }
+
+                    @Override
+                    public TableInfo tableInfo() {
+                        return tableInfo;
+                    }
+
+                    @Override
+                    public Configuration lakeTieringConfig() {
+                        return new Configuration();
+                    }
+
+                    @Override
+                    public Configuration flussClientConfig() {
+                        return new Configuration();
+                    }
+                });
     }
 
     private LakeWriter<LanceWriteResult> createLakeWriter(
@@ -284,19 +316,21 @@ class LanceTieringTest {
         List<LogRecord> logRecords = new ArrayList<>();
         for (int i = 0; i < numRecords; i++) {
             GenericRow genericRow;
-            if (partition != null) {
-                // Partitioned table: include partition field in data
-                genericRow = new GenericRow(3); // c1, c2, c3(partition)
-                genericRow.setField(0, i);
-                genericRow.setField(1, BinaryString.fromString("bucket" + bucket + "_" + i));
-                genericRow.setField(2, BinaryString.fromString(partition)); // partition field
-            } else {
-                // Non-partitioned table
-                genericRow = new GenericRow(3);
-                genericRow.setField(0, i);
-                genericRow.setField(1, BinaryString.fromString("bucket" + bucket + "_" + i));
+
+            // Partitioned table: include partition field in data
+            genericRow = new GenericRow(4); // c1, c2, c3(partition), embedding
+            genericRow.setField(0, i);
+            genericRow.setField(1, BinaryString.fromString("bucket" + bucket + "_" + i));
+
+            if (partition == null) {
                 genericRow.setField(2, BinaryString.fromString("bucket" + bucket));
+            } else {
+                genericRow.setField(2, BinaryString.fromString(partition));
             }
+
+            genericRow.setField(
+                    3, new GenericArray(new float[] {0.1f * i, 0.2f * i, 0.3f * i, 0.4f * i}));
+
             LogRecord logRecord =
                     new GenericRecord(
                             i, System.currentTimeMillis(), ChangeType.APPEND_ONLY, genericRow);
@@ -305,16 +339,19 @@ class LanceTieringTest {
         return Tuple2.of(logRecords, logRecords);
     }
 
-    private Schema createTable(LanceConfig config) throws Exception {
+    private Schema createTable(LanceConfig config, Map<String, String> customProperties) {
         List<Schema.Column> columns = new ArrayList<>();
         columns.add(new Schema.Column("c1", DataTypes.INT()));
         columns.add(new Schema.Column("c2", DataTypes.STRING()));
         columns.add(new Schema.Column("c3", DataTypes.STRING()));
+        columns.add(new Schema.Column("embedding", DataTypes.ARRAY(DataTypes.FLOAT())));
         Schema.Builder schemaBuilder = Schema.newBuilder().fromColumns(columns);
         Schema schema = schemaBuilder.build();
         WriteParams params = LanceConfig.genWriteParamsFromConfig(config);
         LanceDatasetAdapter.createDataset(
-                config.getDatasetUri(), LanceArrowUtils.toArrowSchema(schema.getRowType()), params);
+                config.getDatasetUri(),
+                LanceArrowUtils.toArrowSchema(schema.getRowType(), customProperties),
+                params);
 
         return schema;
     }

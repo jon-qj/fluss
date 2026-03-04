@@ -31,9 +31,10 @@ import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
-import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -45,12 +46,14 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
@@ -74,6 +77,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.metadata.ServerMetadataCache;
+import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -86,7 +90,6 @@ import org.apache.fluss.server.zk.ZkSequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
-import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
@@ -105,7 +108,6 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -167,7 +169,8 @@ public final class Replica {
     /** The manger to manger the isr expand and shrink. */
     private final AdjustIsrManager adjustIsrManager;
 
-    private final Schema schema;
+    private final SchemaGetter schemaGetter;
+    private final TableInfo tableInfo;
     private final TableConfig tableConfig;
     // logFormat and arrowCompressionInfo are used in hot-path, so cache them here.
     private final LogFormat logFormat;
@@ -216,7 +219,7 @@ public final class Replica {
             DelayedOperationManager<DelayedFetchLog> delayedFetchLogManager,
             AdjustIsrManager adjustIsrManager,
             SnapshotContext snapshotContext,
-            ServerMetadataCache metadataCache,
+            TabletServerMetadataCache metadataCache,
             FatalErrorHandler fatalErrorHandler,
             BucketMetricGroup bucketMetricGroup,
             TableInfo tableInfo,
@@ -235,7 +238,13 @@ public final class Replica {
         this.adjustIsrManager = adjustIsrManager;
         this.fatalErrorHandler = fatalErrorHandler;
         this.bucketMetricGroup = bucketMetricGroup;
-        this.schema = tableInfo.getSchema();
+        this.schemaGetter =
+                metadataCache.subscribeWithInitialSchema(
+                        physicalPath.getTablePath(),
+                        tableInfo.getTableId(),
+                        tableInfo.getSchemaId(),
+                        tableInfo.getSchema());
+        this.tableInfo = tableInfo;
         this.tableConfig = tableInfo.getTableConfig();
         this.logFormat = tableConfig.getLogFormat();
         this.arrowCompressionInfo = tableConfig.getArrowCompressionInfo();
@@ -244,6 +253,7 @@ public final class Replica {
         this.closeableRegistry = new CloseableRegistry();
 
         this.logTablet = createLog(lazyHighWatermarkCheckpoint);
+        this.logTablet.updateIsDataLakeEnabled(tableConfig.isDataLakeEnabled());
         this.clock = clock;
         registerMetrics();
     }
@@ -286,10 +296,6 @@ public final class Replica {
         return kvManager != null;
     }
 
-    public RowType getRowType() {
-        return schema.getRowType();
-    }
-
     public ArrowCompressionInfo getArrowCompressionInfo() {
         return arrowCompressionInfo;
     }
@@ -300,6 +306,10 @@ public final class Replica {
 
     public int getCoordinatorEpoch() {
         return coordinatorEpoch;
+    }
+
+    public TableInfo getTableInfo() {
+        return tableInfo;
     }
 
     public @Nullable Integer getLeaderId() {
@@ -372,6 +382,10 @@ public final class Replica {
 
     public TableMetricGroup tableMetrics() {
         return bucketMetricGroup.getTableMetricGroup();
+    }
+
+    public LogFormat getLogFormat() {
+        return logFormat;
     }
 
     public void makeLeader(NotifyLeaderAndIsrData data) throws IOException {
@@ -491,37 +505,9 @@ public final class Replica {
                     // drop log then
                     logManager.dropLog(tableBucket);
                     // close the closeable registry
+                    IOUtils.closeQuietly(schemaGetter::release);
                     IOUtils.closeQuietly(closeableRegistry);
                 });
-    }
-
-    public void checkProjection(@Nullable int[] projectedFields) {
-        if (projectedFields != null) {
-            if (logFormat != LogFormat.ARROW) {
-                throw new InvalidColumnProjectionException(
-                        String.format(
-                                "Column projection is only supported for ARROW format, but the table %s is %s format.",
-                                physicalPath.getTablePath(), logFormat));
-            }
-            int fieldCount = schema.getColumns().size();
-            int prev = -1;
-            for (int i : projectedFields) {
-                if (i <= prev) {
-                    throw new InvalidColumnProjectionException(
-                            "The projection indexes should be in field order, but is "
-                                    + Arrays.toString(projectedFields));
-                }
-                if (i >= fieldCount) {
-                    throw new InvalidColumnProjectionException(
-                            "Projected fields "
-                                    + Arrays.toString(projectedFields)
-                                    + " is out of bound for schema with "
-                                    + fieldCount
-                                    + " fields.");
-                }
-                prev = i;
-            }
-        }
     }
 
     public LogOffsetSnapshot fetchOffsetSnapshot(boolean fetchOnlyFromLeader) throws IOException {
@@ -558,7 +544,7 @@ public final class Replica {
                 MetricNames.LOG_LAKE_PENDING_RECORDS,
                 () ->
                         getLakeLogEndOffset() < 0L
-                                ? -1
+                                ? getLogHighWatermark() - getLogStartOffset()
                                 : getLogHighWatermark() - getLakeLogEndOffset());
         lakeTieringMetricGroup.gauge(
                 MetricNames.LOG_LAKE_TIMESTAMP_LAG,
@@ -581,6 +567,53 @@ public final class Replica {
     @VisibleForTesting
     public void updateLeaderEndOffsetSnapshot() {
         logTablet.updateLeaderEndOffsetSnapshot();
+    }
+
+    public void updateIsDataLakeEnabled(boolean isDataLakeEnabled) {
+        boolean old = logTablet.isDataLakeEnabled();
+        if (old == isDataLakeEnabled) {
+            return;
+        }
+
+        logTablet.updateIsDataLakeEnabled(isDataLakeEnabled);
+
+        if (isLeader()) {
+            if (isDataLakeEnabled) {
+                registerLakeTieringMetrics();
+            } else {
+                if (lakeTieringMetricGroup != null) {
+                    lakeTieringMetricGroup.close();
+                    lakeTieringMetricGroup = null;
+                }
+            }
+        }
+
+        LOG.info(
+                "Replica for {} isDataLakeEnabled changed from {} to {}",
+                tableBucket,
+                old,
+                isDataLakeEnabled);
+    }
+
+    /**
+     * Update the number of log segments to retain in local storage. This method is called when the
+     * table configuration is altered.
+     *
+     * @param tieredLogLocalSegments the new number of segments to retain locally
+     */
+    public void updateTieredLogLocalSegments(int tieredLogLocalSegments) {
+        int oldValue = logTablet.getTieredLogLocalSegments();
+        if (oldValue == tieredLogLocalSegments) {
+            return;
+        }
+
+        logTablet.updateTieredLogLocalSegments(tieredLogLocalSegments);
+
+        LOG.info(
+                "Replica for {} tieredLogLocalSegments changed from {} to {}",
+                tableBucket,
+                oldValue,
+                tieredLogLocalSegments);
     }
 
     private void createKv() {
@@ -620,6 +653,10 @@ public final class Replica {
             IOUtils.closeQuietly(closeableRegistryForKv);
         }
         if (kvTablet != null) {
+            // Unregister RocksDB statistics before dropping KvTablet
+            // This ensures statistics are cleaned up when KvTablet is destroyed
+            bucketMetricGroup.unregisterRocksDBStatistics();
+
             // drop the kv tablet
             checkNotNull(kvManager);
             kvManager.dropKv(tableBucket);
@@ -662,6 +699,8 @@ public final class Replica {
         long restoreStartOffset = 0;
         Optional<CompletedSnapshot> optCompletedSnapshot = getLatestSnapshot(tableBucket);
         try {
+            Long rowCount;
+            AutoIncIDRange autoIncIDRange;
             if (optCompletedSnapshot.isPresent()) {
                 LOG.info(
                         "Use snapshot {} to restore kv tablet for {} of table {}.",
@@ -675,15 +714,19 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet = kvManager.loadKv(tabletDir);
+                kvTablet = kvManager.loadKv(tabletDir, schemaGetter);
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
+                rowCount = completedSnapshot.getRowCount();
+                // currently, we only support one auto-increment column.
+                autoIncIDRange = completedSnapshot.getFirstAutoIncIDRange();
             } else {
                 LOG.info(
                         "No snapshot found for {} of {}, restore from log.",
                         tableBucket,
                         physicalPath);
+
                 // actually, kv manager always create a kv tablet since we will drop the kv
                 // if it exists before init kv tablet
                 kvTablet =
@@ -692,13 +735,22 @@ public final class Replica {
                                 tableBucket,
                                 logTablet,
                                 tableConfig.getKvFormat(),
-                                schema,
+                                schemaGetter,
                                 tableConfig,
                                 arrowCompressionInfo);
+
+                // we don't support rowCount
+                rowCount = tableConfig.getChangelogImage() == ChangelogImage.WAL ? null : 0L;
+                // TODO: it is possible that this is a recovered kv tablet without kv snapshot but
+                //  with changelogs, in this case, the kv tablet should also have the
+                //  autoIncIDRange, we may need to get it from the changelog in the future.
+                //  but currently, we set it to null for simplification, as the auto-inc id
+                //  will be fetched from zk if not exist in local.
+                autoIncIDRange = null;
             }
 
             logTablet.updateMinRetainOffset(restoreStartOffset);
-            recoverKvTablet(restoreStartOffset);
+            recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
         } catch (Exception e) {
             throw new KvStorageException(
                     String.format(
@@ -712,6 +764,12 @@ public final class Replica {
                 physicalPath,
                 tableBucket,
                 endTime - startTime);
+
+        // Register RocksDB statistics to BucketMetricGroup
+        if (kvTablet != null && kvTablet.getRocksDBStatistics() != null) {
+            bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
+        }
+
         return optCompletedSnapshot;
     }
 
@@ -758,14 +816,16 @@ public final class Replica {
         return Optional.empty();
     }
 
-    private void recoverKvTablet(long startRecoverLogOffset) {
+    private void recoverKvTablet(
+            long startRecoverLogOffset,
+            @Nullable Long rowCount,
+            @Nullable AutoIncIDRange autoIncIDRange) {
         long start = clock.milliseconds();
         checkNotNull(kvTablet, "kv tablet should not be null.");
         try {
             KvRecoverHelper.KvRecoverContext recoverContext =
                     new KvRecoverHelper.KvRecoverContext(
                             getTablePath(),
-                            tableBucket,
                             snapshotContext.getZooKeeperClient(),
                             snapshotContext.maxFetchLogSizeInRecoverKv());
             KvRecoverHelper kvRecoverHelper =
@@ -773,8 +833,12 @@ public final class Replica {
                             kvTablet,
                             logTablet,
                             startRecoverLogOffset,
+                            rowCount,
+                            autoIncIDRange,
                             recoverContext,
-                            tableConfig.getKvFormat());
+                            tableConfig.getKvFormat(),
+                            tableConfig.getLogFormat(),
+                            schemaGetter);
             kvRecoverHelper.recover();
         } catch (Exception e) {
             throw new KvStorageException(
@@ -856,7 +920,7 @@ public final class Replica {
                             snapshotContext.getAsyncOperationsThreadPool(),
                             closeableRegistryForKv,
                             snapshotIDCounter,
-                            kvTablet::getFlushedLogOffset,
+                            kvTablet::getTabletState,
                             logTablet::updateMinRetainOffset,
                             bucketLeaderEpochSupplier,
                             coordinatorEpochSupplier,
@@ -924,7 +988,10 @@ public final class Replica {
     }
 
     public LogAppendInfo putRecordsToLeader(
-            KvRecordBatch kvRecords, @Nullable int[] targetColumns, int requiredAcks)
+            KvRecordBatch kvRecords,
+            @Nullable int[] targetColumns,
+            MergeMode mergeMode,
+            int requiredAcks)
             throws Exception {
         return inReadLock(
                 leaderIsrUpdateLock,
@@ -942,7 +1009,7 @@ public final class Replica {
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
                     LogAppendInfo logAppendInfo;
                     try {
-                        logAppendInfo = kv.putAsLeader(kvRecords, targetColumns);
+                        logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
                     } catch (IOException e) {
                         LOG.error("Error while putting records to {}", tableBucket, e);
                         fatalErrorHandler.onFatalError(e);
@@ -1312,6 +1379,21 @@ public final class Replica {
         }
     }
 
+    public long getRowCount() {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    KvTablet kv = this.kvTablet;
+                    if (kv != null) {
+                        // return materialized row count for primary key table
+                        return kv.getRowCount();
+                    } else {
+                        // return log row count for non-primary key table
+                        return logTablet.getRowCount();
+                    }
+                });
+    }
+
     public long getOffset(RemoteLogManager remoteLogManager, ListOffsetsParam listOffsetsParam)
             throws IOException {
         return inReadLock(
@@ -1599,7 +1681,7 @@ public final class Replica {
                                             // We don't know what happened on the coordinator server
                                             // exactly, but we do know this response is out of date,
                                             // so we ignore it.
-                                            LOG.debug(
+                                            LOG.warn(
                                                     "Ignoring failed ISR update to {} for bucket {} since we have already updated state to {}",
                                                     proposedIsrState,
                                                     tableBucket,
@@ -1936,5 +2018,16 @@ public final class Replica {
     @VisibleForTesting
     public List<Integer> getIsr() {
         return isrState.isr();
+    }
+
+    @VisibleForTesting
+    public SchemaGetter getSchemaGetter() {
+        return schemaGetter;
+    }
+
+    @VisibleForTesting
+    @Nullable
+    public PeriodicSnapshotManager getKvSnapshotManager() {
+        return kvSnapshotManager;
     }
 }

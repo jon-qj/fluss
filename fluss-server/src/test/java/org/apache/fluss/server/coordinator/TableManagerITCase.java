@@ -23,7 +23,6 @@ import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.exception.DatabaseAlreadyExistException;
 import org.apache.fluss.exception.DatabaseNotEmptyException;
 import org.apache.fluss.exception.DatabaseNotExistException;
@@ -36,6 +35,7 @@ import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.registry.MetricRegistry;
 import org.apache.fluss.rpc.GatewayClientProxy;
@@ -44,12 +44,13 @@ import org.apache.fluss.rpc.gateway.AdminGateway;
 import org.apache.fluss.rpc.gateway.AdminReadOnlyGateway;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.CreateTableRequest;
 import org.apache.fluss.rpc.messages.GetTableInfoResponse;
 import org.apache.fluss.rpc.messages.GetTableSchemaRequest;
 import org.apache.fluss.rpc.messages.ListDatabasesRequest;
 import org.apache.fluss.rpc.messages.MetadataRequest;
 import org.apache.fluss.rpc.messages.MetadataResponse;
-import org.apache.fluss.rpc.messages.PbAlterConfig;
+import org.apache.fluss.rpc.messages.PbAddColumn;
 import org.apache.fluss.rpc.messages.PbBucketMetadata;
 import org.apache.fluss.rpc.messages.PbPartitionMetadata;
 import org.apache.fluss.rpc.messages.PbServerNode;
@@ -61,7 +62,11 @@ import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.types.DataTypeChecks;
 import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.json.DataTypeJsonSerde;
+import org.apache.fluss.utils.json.JsonSerdeUtils;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -87,6 +92,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newAlterTableRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newCreateDatabaseRequest;
@@ -285,7 +291,12 @@ class TableManagerITCase {
         GetTableInfoResponse response =
                 gateway.getTableInfo(newGetTableInfoRequest(tablePath)).get();
         TableDescriptor gottenTable = TableDescriptor.fromJsonBytes(response.getTableJson());
-        assertThat(gottenTable).isEqualTo(tableDescriptor.withReplicationFactor(1));
+        Map<String, String> properties = new HashMap<>(gottenTable.getProperties());
+        properties.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        assertThat(gottenTable)
+                .isEqualTo(tableDescriptor.withProperties(properties).withReplicationFactor(1));
 
         // alter table
         Map<String, String> setProperties = new HashMap<>();
@@ -297,7 +308,9 @@ class TableManagerITCase {
                 .alterTable(
                         newAlterTableRequest(
                                 tablePath,
-                                alterTableProperties(setProperties, resetProperties),
+                                setProperties,
+                                resetProperties,
+                                Collections.emptyList(),
                                 false))
                 .get();
         // get the table and check it
@@ -328,13 +341,9 @@ class TableManagerITCase {
         assertThat(gottenSchema).isEqualTo(tableDescriptor.getSchema());
 
         // then create the table with same name again, should throw exception
-        assertThatThrownBy(
-                        () ->
-                                adminGateway
-                                        .createTable(
-                                                newCreateTableRequest(
-                                                        tablePath, tableDescriptor, false))
-                                        .get())
+        CreateTableRequest createTableRequest =
+                newCreateTableRequest(tablePath, tableDescriptor, false);
+        assertThatThrownBy(() -> adminGateway.createTable(createTableRequest).get())
                 .cause()
                 .isInstanceOf(TableAlreadyExistException.class)
                 .hasMessageContaining(String.format("Table %s already exists.", tablePath));
@@ -477,6 +486,13 @@ class TableManagerITCase {
         assertThat(metadataResponse.getTableMetadatasCount()).isEqualTo(1);
         PbTableMetadata tableMetadata = metadataResponse.getTableMetadataAt(0);
         assertThat(toTablePath(tableMetadata.getTablePath())).isEqualTo(tablePath);
+
+        Map<String, String> properties = new HashMap<>(tableDescriptor.getProperties());
+        properties.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        tableDescriptor = tableDescriptor.withProperties(properties);
+
         assertThat(TableDescriptor.fromJsonBytes(tableMetadata.getTableJson()))
                 .isEqualTo(tableDescriptor.withReplicationFactor(1));
 
@@ -655,6 +671,64 @@ class TableManagerITCase {
                         FLUSS_CLUSTER_EXTENSION.getTabletServerNodes());
     }
 
+    @Test
+    void testSchemaEvolution() throws Exception {
+        AdminReadOnlyGateway gateway = getAdminOnlyGateway(true);
+        AdminGateway adminGateway = getAdminGateway();
+
+        // create database and table
+        String db1 = "db1";
+        String tb1 = "tb1";
+        TablePath tablePath = TablePath.of(db1, tb1);
+        adminGateway.createDatabase(newCreateDatabaseRequest(db1, false)).get();
+        TableDescriptor tableDescriptor = newPkTable();
+        adminGateway.createTable(newCreateTableRequest(tablePath, tableDescriptor, false)).get();
+
+        // add column
+        adminGateway
+                .alterTable(
+                        newAlterTableRequest(
+                                tablePath,
+                                Collections.emptyMap(),
+                                Collections.emptyList(),
+                                alterTableAddColumns(),
+                                false))
+                .get();
+
+        // restart coordinatorServer
+        FLUSS_CLUSTER_EXTENSION.stopCoordinatorServer();
+        FLUSS_CLUSTER_EXTENSION.startCoordinatorServer();
+
+        // check metadata response
+        MetadataResponse metadataResponse =
+                gateway.metadata(newMetadataRequest(Collections.singletonList(tablePath))).get();
+        assertThat(metadataResponse.getTableMetadatasCount()).isEqualTo(1);
+        PbTableMetadata pbTableMetadata = metadataResponse.getTableMetadataAt(0);
+        assertThat(pbTableMetadata.getSchemaId()).isEqualTo(2);
+        TableInfo tableInfo =
+                TableInfo.of(
+                        tablePath,
+                        pbTableMetadata.getTableId(),
+                        pbTableMetadata.getSchemaId(),
+                        TableDescriptor.fromJsonBytes(pbTableMetadata.getTableJson()),
+                        pbTableMetadata.getCreatedTime(),
+                        pbTableMetadata.getModifiedTime());
+        List<Schema.Column> columns = tableInfo.getSchema().getColumns();
+        assertThat(columns.size()).isEqualTo(4);
+        assertThat(tableInfo.getSchema().getColumnIds()).containsExactly(0, 1, 2, 5);
+        // check nested row's field_id.
+        assertThat(columns.get(2).getName()).isEqualTo("new_nested_column");
+        assertThat(
+                        DataTypeChecks.equalsWithFieldId(
+                                columns.get(2).getDataType(),
+                                new RowType(
+                                        true,
+                                        Arrays.asList(
+                                                DataTypes.FIELD("f0", DataTypes.STRING(), 3),
+                                                DataTypes.FIELD("f1", DataTypes.INT(), 4)))))
+                .isTrue();
+    }
+
     private void checkBucketMetadata(int expectBucketCount, List<PbBucketMetadata> bucketMetadata) {
         Set<Integer> liveServers =
                 FLUSS_CLUSTER_EXTENSION.getTabletServerNodes().stream()
@@ -759,26 +833,30 @@ class TableManagerITCase {
                 .build();
     }
 
-    private static List<PbAlterConfig> alterTableProperties(
-            Map<String, String> setProperties, List<String> resetProperties) {
-        List<PbAlterConfig> res = new ArrayList<>();
+    private static List<PbAddColumn> alterTableAddColumns() {
+        List<PbAddColumn> addColumns = new ArrayList<>();
+        PbAddColumn newNestedColumn = new PbAddColumn();
+        newNestedColumn
+                .setColumnName("new_nested_column")
+                .setDataTypeJson(
+                        JsonSerdeUtils.writeValueAsBytes(
+                                DataTypes.ROW(DataTypes.STRING(), DataTypes.INT()),
+                                DataTypeJsonSerde.INSTANCE))
+                .setComment("new_nested_column")
+                .setColumnPositionType(0);
+        addColumns.add(newNestedColumn);
 
-        for (Map.Entry<String, String> entry : setProperties.entrySet()) {
-            PbAlterConfig info = new PbAlterConfig();
-            info.setConfigKey(entry.getKey());
-            info.setConfigValue(entry.getValue());
-            info.setOpType(AlterConfigOpType.SET.value());
-            res.add(info);
-        }
+        PbAddColumn newColumn = new PbAddColumn();
+        newColumn
+                .setColumnName("new_column")
+                .setDataTypeJson(
+                        JsonSerdeUtils.writeValueAsBytes(
+                                DataTypes.STRING(), DataTypeJsonSerde.INSTANCE))
+                .setComment("new_column")
+                .setColumnPositionType(0);
+        addColumns.add(newColumn);
 
-        for (String resetProperty : resetProperties) {
-            PbAlterConfig info = new PbAlterConfig();
-            info.setConfigKey(resetProperty);
-            info.setOpType(AlterConfigOpType.DELETE.value());
-            res.add(info);
-        }
-
-        return res;
+        return addColumns;
     }
 
     private static Schema newPkSchema() {

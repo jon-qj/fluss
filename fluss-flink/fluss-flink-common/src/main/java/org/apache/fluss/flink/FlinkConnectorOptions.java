@@ -18,6 +18,7 @@
 package org.apache.fluss.flink;
 
 import org.apache.fluss.config.FlussConfigUtils;
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.flink.utils.FlinkConversions;
 
 import org.apache.flink.configuration.ConfigOption;
@@ -30,11 +31,25 @@ import org.apache.flink.table.catalog.IntervalFreshness;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.UUID;
 
 import static org.apache.flink.configuration.description.TextElement.text;
 
 /** Options for flink connector. */
 public class FlinkConnectorOptions {
+
+    public static final ConfigOption<String> AUTO_INCREMENT_FIELDS =
+            ConfigOptions.key("auto-increment.fields")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Defines the auto increment columns. "
+                                    + "The auto increment column can only be used in primary-key table."
+                                    + "With an auto increment column in the table, whenever a new row is inserted into the table, "
+                                    + "the new row will be assigned with the next available value from the auto-increment sequence."
+                                    + "The data type of the auto increment column must be INT or BIGINT."
+                                    + "Currently a table can have only one auto-increment column."
+                                    + "Adding an auto increment column to an existing table is not supported.");
 
     public static final ConfigOption<Integer> BUCKET_NUMBER =
             ConfigOptions.key("bucket.num")
@@ -62,6 +77,24 @@ public class FlinkConnectorOptions {
                             "A list of host/port pairs to use for establishing the initial connection to the Fluss cluster. "
                                     + "The list should be in the form host1:port1,host2:port2,....");
 
+    public static final ConfigOption<String> SCAN_KV_SNAPSHOT_LEASE_ID =
+            ConfigOptions.key("scan.kv.snapshot.lease.id")
+                    .stringType()
+                    .defaultValue(String.valueOf(UUID.randomUUID()))
+                    .withDescription(
+                            "The lease ID used to protect acquired KV snapshots from deletion. If specified, "
+                                    + "the snapshots will be retained until either the consumer finishes "
+                                    + "processing all of them or the lease duration expires. By default, "
+                                    + "this value is set to a randomly generated UUID string if not explicitly provided.");
+
+    public static final ConfigOption<Duration> SCAN_KV_SNAPSHOT_LEASE_DURATION =
+            ConfigOptions.key("scan.kv.snapshot.lease.duration")
+                    .durationType()
+                    .defaultValue(Duration.ofDays(1))
+                    .withDescription(
+                            "The time period how long to wait before expiring the kv snapshot lease to "
+                                    + "avoid kv snapshot blocking to delete.");
+
     // --------------------------------------------------------------------------------------------
     // Lookup specific options
     // --------------------------------------------------------------------------------------------
@@ -71,6 +104,16 @@ public class FlinkConnectorOptions {
                     .booleanType()
                     .defaultValue(true)
                     .withDescription("Whether to set async lookup. Default is true.");
+
+    public static final ConfigOption<Boolean> LOOKUP_INSERT_IF_NOT_EXISTS =
+            ConfigOptions.key("lookup.insert-if-not-exists")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to enable insert-if-not-exists behavior for the lookup operation. "
+                                    + "When enabled, if a lookup does not find a matching row, a new row will be inserted "
+                                    + "with the lookup key values. This feature cannot be used with PREFIX_LOOKUP type. "
+                                    + "Default is false.");
 
     // --------------------------------------------------------------------------------------------
     // Scan specific options
@@ -113,6 +156,16 @@ public class FlinkConnectorOptions {
                     .defaultValue(false)
                     .withDescription("Whether to ignore retract（-U/-D) record.");
 
+    public static final ConfigOption<String> SINK_PRODUCER_ID =
+            ConfigOptions.key("sink.producer-id")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The producer ID for undo recovery. If not set, defaults to the Flink job ID. "
+                                    + "This option is useful for testing or when you need to maintain the same producer ID "
+                                    + "across different job submissions.");
+
+    @Deprecated
     public static final ConfigOption<Boolean> SINK_BUCKET_SHUFFLE =
             ConfigOptions.key("sink.bucket-shuffle")
                     .booleanType()
@@ -123,7 +176,32 @@ public class FlinkConnectorOptions {
                                     + "processing and reduce resource consumption. For Log Table, bucket shuffle will "
                                     + "only take effect when the '"
                                     + BUCKET_KEY.key()
-                                    + "' is defined. For Primary Key table, it is enabled by default.");
+                                    + "' is defined. For Primary Key table, it is enabled by default. "
+                                    + "This option is deprecated. Please use sink.distribution-mode instead, which provides more flexible distribution strategies.");
+
+    public static final ConfigOption<DistributionMode> SINK_DISTRIBUTION_MODE =
+            ConfigOptions.key("sink.distribution-mode")
+                    .enumType(DistributionMode.class)
+                    .defaultValue(DistributionMode.AUTO)
+                    .withDescription(
+                            "Defines the distribution mode for writing data to the sink. Available options are:\n"
+                                    + "- AUTO: Automatically chooses the best mode based on the table type. "
+                                    + "Uses BUCKET mode for Primary Key Tables and Log table with bucket key to maximize throughput, "
+                                    + "and NONE for Log Tables without bucket key.\n"
+                                    + "- NONE: Uses Flink's default shuffle strategy, which is typically FORWARD when the sink parallelism matches the upstream parallelism, or REBALANCE when parallelisms differ.\n"
+                                    + "- BUCKET: Shuffle data by bucket ID before writing to sink. "
+                                    + "This groups data with the same bucket ID to be processed by the same task, "
+                                    + "which improves client processing efficiency and reduces resource consumption. "
+                                    + "This mode is particularly recommended for Primary Key tables as it can significantly "
+                                    + "improve throughput. For Log Tables, bucket shuffle only takes effect when the '"
+                                    + BUCKET_KEY.key()
+                                    + "' is defined. Note: When sink parallelism exceeds the number of buckets, "
+                                    + "some sink tasks may remain idle without receiving data.\n"
+                                    + "- PARTITION_DYNAMIC: Dynamically adjusts shuffle strategy based on partition key traffic patterns. "
+                                    + "This mode monitors data distribution and adjusts the shuffle behavior to balance the load. "
+                                    + "It is only supported for partitioned Log Tables, not for Primary Key tables now. "
+                                    + "Use this mode when data is highly skewed across partitions or when there are many partitions. "
+                                    + "Note: This mode has overhead costs including data statistics collection and additional shuffle operations.");
 
     // --------------------------------------------------------------------------------------------
     // table storage specific options
@@ -144,7 +222,11 @@ public class FlinkConnectorOptions {
     // --------------------------------------------------------------------------------------------
 
     public static final List<String> ALTER_DISALLOW_OPTIONS =
-            Arrays.asList(BUCKET_NUMBER.key(), BUCKET_KEY.key(), BOOTSTRAP_SERVERS.key());
+            Arrays.asList(
+                    AUTO_INCREMENT_FIELDS.key(),
+                    BUCKET_NUMBER.key(),
+                    BUCKET_KEY.key(),
+                    BOOTSTRAP_SERVERS.key());
 
     // -------------------------------------------------------------------------------------------
     // Only used internally to support materialized table
@@ -201,7 +283,13 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "The serialized base64 bytes of refresh handler of materialized table.");
 
-    // ------------------------------------------------------------------------------------------
+    /** Internal option to indicate whether the base table is partitioned for $binlog sources. */
+    public static final ConfigOption<Boolean> INTERNAL_BINLOG_IS_PARTITIONED =
+            ConfigOptions.key("_internal.binlog.is-partitioned")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Internal option: indicates whether the base table is partitioned for $binlog virtual tables. Not part of public API.");
 
     /** Startup mode for the fluss scanner, see {@link #SCAN_STARTUP_MODE}. */
     public enum ScanStartupMode implements DescribedEnum {

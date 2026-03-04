@@ -20,19 +20,27 @@ package org.apache.fluss.server.coordinator;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.cluster.rebalance.GoalType;
+import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
+import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.InvalidAlterTableException;
+import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidDatabaseException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.LakeTableAlreadyExistException;
+import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
+import org.apache.fluss.exception.UnknownServerException;
+import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.lakestorage.LakeCatalog;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseDescriptor;
@@ -40,16 +48,24 @@ import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.AddServerTagRequest;
+import org.apache.fluss.rpc.messages.AddServerTagResponse;
 import org.apache.fluss.rpc.messages.AdjustIsrRequest;
 import org.apache.fluss.rpc.messages.AdjustIsrResponse;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsResponse;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.AlterTableResponse;
+import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
+import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
@@ -66,23 +82,47 @@ import org.apache.fluss.rpc.messages.CreatePartitionRequest;
 import org.apache.fluss.rpc.messages.CreatePartitionResponse;
 import org.apache.fluss.rpc.messages.CreateTableRequest;
 import org.apache.fluss.rpc.messages.CreateTableResponse;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsResponse;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropAclsResponse;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
 import org.apache.fluss.rpc.messages.DropDatabaseResponse;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressRequest;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressResponse;
 import org.apache.fluss.rpc.messages.MetadataRequest;
 import org.apache.fluss.rpc.messages.MetadataResponse;
 import org.apache.fluss.rpc.messages.PbAlterConfig;
 import org.apache.fluss.rpc.messages.PbHeartbeatReqForTable;
 import org.apache.fluss.rpc.messages.PbHeartbeatRespForTable;
+import org.apache.fluss.rpc.messages.PbKvSnapshotLeaseForTable;
+import org.apache.fluss.rpc.messages.PbPrepareLakeTableRespForTable;
+import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
+import org.apache.fluss.rpc.messages.PbTableBucket;
+import org.apache.fluss.rpc.messages.PbTableOffsets;
+import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.RebalanceRequest;
+import org.apache.fluss.rpc.messages.RebalanceResponse;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
+import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
+import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
 import org.apache.fluss.rpc.netty.server.Session;
 import org.apache.fluss.rpc.protocol.ApiError;
+import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 import org.apache.fluss.security.acl.FlussPrincipal;
@@ -94,12 +134,21 @@ import org.apache.fluss.server.authorizer.AclCreateResult;
 import org.apache.fluss.server.authorizer.AclDeleteResult;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.coordinator.event.AccessContextEvent;
+import org.apache.fluss.server.coordinator.event.AddServerTagEvent;
 import org.apache.fluss.server.coordinator.event.AdjustIsrReceivedEvent;
+import org.apache.fluss.server.coordinator.event.CancelRebalanceEvent;
 import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitLakeTableSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
 import org.apache.fluss.server.coordinator.event.ControlledShutdownEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
+import org.apache.fluss.server.coordinator.event.ListRebalanceProgressEvent;
+import org.apache.fluss.server.coordinator.event.RebalanceEvent;
+import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseHandler;
+import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
+import org.apache.fluss.server.coordinator.producer.ProducerOffsetsManager;
+import org.apache.fluss.server.coordinator.rebalance.goal.Goal;
 import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.LakeTieringTableInfo;
 import org.apache.fluss.server.entity.TablePropertyChanges;
@@ -107,35 +156,58 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metadata.CoordinatorMetadataProvider;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.lake.LakeTable;
+import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.concurrent.FutureUtils;
+import org.apache.fluss.utils.json.TableBucketOffsets;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.FlussConfigUtils.isTableStorageConfig;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindingFilters;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindings;
+import static org.apache.fluss.server.coordinator.rebalance.goal.GoalUtils.getGoalByType;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.addTableOffsetsToResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.fromTablePath;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAcquireKvSnapshotLeaseData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitLakeTableSnapshotData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitRemoteLogManifestData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getPartitionSpec;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getReleaseKvSnapshotLeaseData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.groupOffsetsByTableId;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeAcquireKvSnapshotLeaseResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeCreateAclsResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeDropAclsResponse;
-import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTableChanges;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toAlterTableConfigChanges;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toAlterTableSchemaChanges;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTableBucketOffsets;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTablePath;
 import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
 import static org.apache.fluss.utils.PartitionUtils.validatePartitionSpec;
@@ -143,6 +215,8 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** An RPC Gateway service for coordinator server. */
 public final class CoordinatorService extends RpcServiceBase implements CoordinatorGateway {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CoordinatorService.class);
 
     private final int defaultBucketNumber;
     private final int defaultReplicationFactor;
@@ -154,6 +228,10 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
     private final LakeTableTieringManager lakeTableTieringManager;
     private final LakeCatalogDynamicLoader lakeCatalogDynamicLoader;
+    private final ExecutorService ioExecutor;
+    private final LakeTableHelper lakeTableHelper;
+    private final ProducerOffsetsManager producerOffsetsManager;
+    private final KvSnapshotLeaseManager kvSnapshotLeaseManager;
 
     public CoordinatorService(
             Configuration conf,
@@ -165,14 +243,17 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             @Nullable Authorizer authorizer,
             LakeCatalogDynamicLoader lakeCatalogDynamicLoader,
             LakeTableTieringManager lakeTableTieringManager,
-            DynamicConfigManager dynamicConfigManager) {
+            DynamicConfigManager dynamicConfigManager,
+            ExecutorService ioExecutor,
+            KvSnapshotLeaseManager kvSnapshotLeaseManager) {
         super(
                 remoteFileSystem,
                 ServerType.COORDINATOR,
                 zkClient,
                 metadataManager,
                 authorizer,
-                dynamicConfigManager);
+                dynamicConfigManager,
+                ioExecutor);
         this.defaultBucketNumber = conf.getInt(ConfigOptions.DEFAULT_BUCKET_NUMBER);
         this.defaultReplicationFactor = conf.getInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR);
         this.logTableAllowCreation = conf.getBoolean(ConfigOptions.LOG_TABLE_ALLOW_CREATION);
@@ -184,6 +265,15 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         this.lakeTableTieringManager = lakeTableTieringManager;
         this.metadataCache = metadataCache;
         this.lakeCatalogDynamicLoader = lakeCatalogDynamicLoader;
+        this.ioExecutor = ioExecutor;
+        this.lakeTableHelper =
+                new LakeTableHelper(zkClient, conf.getString(ConfigOptions.REMOTE_DATA_DIR));
+
+        // Initialize and start the producer snapshot manager
+        this.producerOffsetsManager = new ProducerOffsetsManager(conf, zkClient);
+        this.producerOffsetsManager.start();
+
+        this.kvSnapshotLeaseManager = kvSnapshotLeaseManager;
     }
 
     @Override
@@ -193,7 +283,60 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
     @Override
     public void shutdown() {
+        IOUtils.closeQuietly(producerOffsetsManager, "producer snapshot manager");
         IOUtils.closeQuietly(lakeCatalogDynamicLoader, "lake catalog");
+    }
+
+    @Override
+    public void authorizeTable(OperationType operationType, long tableId) {
+        if (authorizer != null) {
+            authorizeTableWithSession(currentSession(), operationType, tableId);
+        }
+    }
+
+    /**
+     * Authorize table access with an explicitly provided session.
+     *
+     * <p>This method is used for async operations where the session must be captured before
+     * entering the async block, since currentSession() relies on thread-local storage.
+     */
+    private void authorizeTableWithSession(
+            Session session, OperationType operationType, long tableId) {
+        TablePath tablePath = getTablePathById(tableId);
+        authorizer.authorize(session, operationType, Resource.table(tablePath));
+    }
+
+    private TablePath getTablePathById(long tableId) {
+        TablePath tablePath;
+        try {
+            // TODO: this will block on the coordinator event thread, consider refactor
+            //  CoordinatorMetadataCache to hold the mapping of table_id to table_path, and then
+            //  we don't need this async request.
+            AccessContextEvent<TablePath> getTablePathEvent =
+                    new AccessContextEvent<>(ctx -> ctx.getTablePathById(tableId));
+            eventManagerSupplier.get().put(getTablePathEvent);
+            tablePath = getTablePathEvent.getResultFuture().get();
+        } catch (Exception e) {
+            throw new UnknownServerException("Failed to get table path by ID " + tableId, e);
+        }
+
+        if (tablePath == null) {
+            throw new UnknownTableOrBucketException(
+                    String.format(
+                            "This server %s does not know this table ID %s. This may happen when the table "
+                                    + "metadata cache in the server is not updated yet.",
+                            name(), tableId));
+        }
+        return tablePath;
+    }
+
+    private void validateKvTable(long tableId) {
+        TablePath tablePath = getTablePathById(tableId);
+        TableInfo tableInfo = metadataManager.getTable(tablePath);
+        if (!tableInfo.hasPrimaryKey()) {
+            throw new NonPrimaryKeyTableException(
+                    "Table '" + tablePath + "' is not a primary key table");
+        }
     }
 
     @Override
@@ -222,13 +365,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
     @Override
     public CompletableFuture<DropDatabaseResponse> dropDatabase(DropDatabaseRequest request) {
-        if (authorizer != null) {
-            authorizer.authorize(
-                    currentSession(),
-                    OperationType.DROP,
-                    Resource.database(request.getDatabaseName()));
-        }
-
+        authorizeDatabase(OperationType.DROP, request.getDatabaseName());
         DropDatabaseResponse response = new DropDatabaseResponse();
         metadataManager.dropDatabase(
                 request.getDatabaseName(), request.isIgnoreIfNotExists(), request.isCascade());
@@ -239,12 +376,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     public CompletableFuture<CreateTableResponse> createTable(CreateTableRequest request) {
         TablePath tablePath = toTablePath(request.getTablePath());
         tablePath.validate();
-        if (authorizer != null) {
-            authorizer.authorize(
-                    currentSession(),
-                    OperationType.CREATE,
-                    Resource.database(tablePath.getDatabaseName()));
-        }
+        authorizeDatabase(OperationType.CREATE, tablePath.getDatabaseName());
 
         TableDescriptor tableDescriptor;
         try {
@@ -291,7 +423,10 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                 tablePath,
                                 tableDescriptor,
                                 new DefaultLakeCatalogContext(
-                                        true, currentSession().getPrincipal()));
+                                        true,
+                                        currentSession().getPrincipal(),
+                                        null,
+                                        tableDescriptor));
             } catch (TableAlreadyExistException e) {
                 throw new LakeTableAlreadyExistException(e.getMessage(), e);
             }
@@ -308,23 +443,36 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     public CompletableFuture<AlterTableResponse> alterTable(AlterTableRequest request) {
         TablePath tablePath = toTablePath(request.getTablePath());
         tablePath.validate();
-        if (authorizer != null) {
-            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.table(tablePath));
+        authorizeTable(OperationType.ALTER, tablePath);
+
+        List<TableChange> alterTableConfigChanges =
+                toAlterTableConfigChanges(request.getConfigChangesList());
+        TablePropertyChanges tablePropertyChanges = toTablePropertyChanges(alterTableConfigChanges);
+        List<TableChange> alterSchemaChanges = toAlterTableSchemaChanges(request);
+
+        if (!alterSchemaChanges.isEmpty() && !alterTableConfigChanges.isEmpty()) {
+            // Only support one of alterTableConfigChanges and alterSchemaChanges for atomic change.
+            throw new InvalidAlterTableException(
+                    "Table alteration can only be applied to one of the following: "
+                            + "table properties or table schema.");
         }
 
-        List<TableChange> tableChanges = toTableChanges(request.getConfigChangesList());
-        TablePropertyChanges tablePropertyChanges = toTablePropertyChanges(tableChanges);
+        if (!alterSchemaChanges.isEmpty()) {
+            metadataManager.alterTableSchema(
+                    tablePath,
+                    alterSchemaChanges,
+                    request.isIgnoreIfNotExists(),
+                    currentSession().getPrincipal());
+        }
 
-        LakeCatalogDynamicLoader.LakeCatalogContainer lakeCatalogContainer =
-                lakeCatalogDynamicLoader.getLakeCatalogContainer();
-        metadataManager.alterTableProperties(
-                tablePath,
-                tableChanges,
-                tablePropertyChanges,
-                request.isIgnoreIfNotExists(),
-                lakeCatalogContainer.getLakeCatalog(),
-                lakeTableTieringManager,
-                new DefaultLakeCatalogContext(false, currentSession().getPrincipal()));
+        if (!alterTableConfigChanges.isEmpty()) {
+            metadataManager.alterTableProperties(
+                    tablePath,
+                    alterTableConfigChanges,
+                    tablePropertyChanges,
+                    request.isIgnoreIfNotExists(),
+                    currentSession().getPrincipal());
+        }
 
         return CompletableFuture.completedFuture(new AlterTableResponse());
     }
@@ -404,12 +552,14 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                             ConfigOptions.TABLE_DATALAKE_ENABLED.key()));
         }
 
-        // For tables with first_row or versioned merge engines, automatically set to IGNORE if
-        // delete behavior is not set
+        // For tables with first_row, versioned or aggregation merge engines, automatically set to
+        // IGNORE if delete behavior is not set
         Configuration tableConf = Configuration.fromMap(tableDescriptor.getProperties());
         MergeEngineType mergeEngine =
                 tableConf.getOptional(ConfigOptions.TABLE_MERGE_ENGINE).orElse(null);
-        if (mergeEngine == MergeEngineType.FIRST_ROW || mergeEngine == MergeEngineType.VERSIONED) {
+        if (mergeEngine == MergeEngineType.FIRST_ROW
+                || mergeEngine == MergeEngineType.VERSIONED
+                || mergeEngine == MergeEngineType.AGGREGATION) {
             if (tableDescriptor.hasPrimaryKey()
                     && !tableConf.getOptional(ConfigOptions.TABLE_DELETE_BEHAVIOR).isPresent()) {
                 Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());
@@ -418,6 +568,28 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 newDescriptor = newDescriptor.withProperties(newProperties);
             }
         }
+
+        if (newDescriptor.hasPrimaryKey()) {
+            Map<String, String> newProperties = new HashMap<>(newDescriptor.getProperties());
+            Integer formatVersion =
+                    Configuration.fromMap(newProperties).get(ConfigOptions.TABLE_KV_FORMAT_VERSION);
+            if (formatVersion == null) {
+                // set current kv format version for default
+                newProperties.put(
+                        ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                        String.valueOf(CURRENT_KV_FORMAT_VERSION));
+                newDescriptor = newDescriptor.withProperties(newProperties);
+            } else {
+                if (formatVersion > CURRENT_KV_FORMAT_VERSION) {
+                    throw new InvalidConfigException(
+                            String.format(
+                                    "Unsupported kv format version %d. "
+                                            + "The maximum supported version is %d.",
+                                    formatVersion, CURRENT_KV_FORMAT_VERSION));
+                }
+            }
+        }
+
         return newDescriptor;
     }
 
@@ -430,12 +602,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<DropTableResponse> dropTable(DropTableRequest request) {
         TablePath tablePath = toTablePath(request.getTablePath());
-        if (authorizer != null) {
-            authorizer.authorize(
-                    currentSession(),
-                    OperationType.DROP,
-                    Resource.table(tablePath.getDatabaseName(), tablePath.getTableName()));
-        }
+        authorizeTable(OperationType.DROP, tablePath);
 
         DropTableResponse response = new DropTableResponse();
         metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
@@ -446,12 +613,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     public CompletableFuture<CreatePartitionResponse> createPartition(
             CreatePartitionRequest request) {
         TablePath tablePath = toTablePath(request.getTablePath());
-        if (authorizer != null) {
-            authorizer.authorize(
-                    currentSession(),
-                    OperationType.WRITE,
-                    Resource.table(tablePath.getDatabaseName(), tablePath.getTableName()));
-        }
+        authorizeTable(OperationType.WRITE, tablePath);
 
         CreatePartitionResponse response = new CreatePartitionResponse();
         TableRegistration table = metadataManager.getTableRegistration(tablePath);
@@ -487,12 +649,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<DropPartitionResponse> dropPartition(DropPartitionRequest request) {
         TablePath tablePath = toTablePath(request.getTablePath());
-        if (authorizer != null) {
-            authorizer.authorize(
-                    currentSession(),
-                    OperationType.WRITE,
-                    Resource.table(tablePath.getDatabaseName(), tablePath.getTableName()));
-        }
+        authorizeTable(OperationType.WRITE, tablePath);
 
         DropPartitionResponse response = new DropPartitionResponse();
         TableRegistration table = metadataManager.getTableRegistration(tablePath);
@@ -518,16 +675,15 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
         AccessContextEvent<MetadataResponse> metadataResponseAccessContextEvent =
                 new AccessContextEvent<>(
-                        ctx -> {
-                            return processMetadataRequest(
-                                    request,
-                                    listenerName,
-                                    session,
-                                    authorizer,
-                                    metadataCache,
-                                    new CoordinatorMetadataProvider(
-                                            zkClient, metadataManager, ctx));
-                        });
+                        ctx ->
+                                processMetadataRequest(
+                                        request,
+                                        listenerName,
+                                        session,
+                                        authorizer,
+                                        metadataCache,
+                                        new CoordinatorMetadataProvider(
+                                                zkClient, metadataManager, ctx)));
         eventManagerSupplier.get().put(metadataResponseAccessContextEvent);
         return metadataResponseAccessContextEvent.getResultFuture();
     }
@@ -590,6 +746,57 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     }
 
     @Override
+    public CompletableFuture<PrepareLakeTableSnapshotResponse> prepareLakeTableSnapshot(
+            PrepareLakeTableSnapshotRequest request) {
+        CompletableFuture<PrepareLakeTableSnapshotResponse> future = new CompletableFuture<>();
+        boolean ignorePreviousBucketOffsets =
+                request.hasIgnorePreviousTableOffsets() && request.isIgnorePreviousTableOffsets();
+        ioExecutor.submit(
+                () -> {
+                    PrepareLakeTableSnapshotResponse response =
+                            new PrepareLakeTableSnapshotResponse();
+                    try {
+                        for (PbTableOffsets bucketOffsets : request.getBucketOffsetsList()) {
+                            PbPrepareLakeTableRespForTable pbPrepareLakeTableRespForTable =
+                                    response.addPrepareLakeTableResp();
+                            try {
+                                long tableId = bucketOffsets.getTableId();
+                                TableBucketOffsets tableBucketOffsets =
+                                        toTableBucketOffsets(bucketOffsets);
+                                if (!ignorePreviousBucketOffsets) {
+                                    // get previous lake tables
+                                    Optional<LakeTable> optPreviousLakeTable =
+                                            zkClient.getLakeTable(tableId);
+                                    if (optPreviousLakeTable.isPresent()) {
+                                        // need to merge with previous lake table
+                                        tableBucketOffsets =
+                                                lakeTableHelper.mergeTableBucketOffsets(
+                                                        optPreviousLakeTable.get(),
+                                                        tableBucketOffsets);
+                                    }
+                                }
+                                TablePath tablePath = toTablePath(bucketOffsets.getTablePath());
+                                FsPath fsPath =
+                                        lakeTableHelper.storeLakeTableOffsetsFile(
+                                                tablePath, tableBucketOffsets);
+                                pbPrepareLakeTableRespForTable.setTableId(tableId);
+                                pbPrepareLakeTableRespForTable.setLakeTableOffsetsPath(
+                                        fsPath.toString());
+                            } catch (Exception e) {
+                                Errors error = ApiError.fromThrowable(e).error();
+                                pbPrepareLakeTableRespForTable.setError(
+                                        error.code(), error.message());
+                            }
+                        }
+                        future.complete(response);
+                    } catch (Exception e) {
+                        future.completeExceptionally(e);
+                    }
+                });
+        return future;
+    }
+
+    @Override
     public CompletableFuture<CommitLakeTableSnapshotResponse> commitLakeTableSnapshot(
             CommitLakeTableSnapshotRequest request) {
         CompletableFuture<CommitLakeTableSnapshotResponse> response = new CompletableFuture<>();
@@ -634,6 +841,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             }
         }
 
+        // process force finished tables
+        Set<Long> forceFinishedTableId = new HashSet<>();
+        for (long forceFinishTableId : request.getForceFinishedTables()) {
+            forceFinishedTableId.add(forceFinishTableId);
+        }
+
         // process finished tables
         for (PbHeartbeatReqForTable finishTable : request.getFinishedTablesList()) {
             PbHeartbeatRespForTable pbHeartbeatRespForTable =
@@ -641,7 +854,9 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             try {
                 validateHeartbeatRequest(finishTable, currentCoordinatorEpoch);
                 lakeTableTieringManager.finishTableTiering(
-                        finishTable.getTableId(), finishTable.getTieringEpoch());
+                        finishTable.getTableId(),
+                        finishTable.getTieringEpoch(),
+                        forceFinishedTableId.contains(finishTable.getTableId()));
             } catch (Throwable e) {
                 pbHeartbeatRespForTable.setError(ApiError.fromThrowable(e).toErrorResponse());
             }
@@ -663,6 +878,10 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<ControlledShutdownResponse> controlledShutdown(
             ControlledShutdownRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
         CompletableFuture<ControlledShutdownResponse> response = new CompletableFuture<>();
         eventManagerSupplier
                 .get()
@@ -672,6 +891,112 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                 request.getTabletServerEpoch(),
                                 response));
         return response;
+    }
+
+    @Override
+    public CompletableFuture<AcquireKvSnapshotLeaseResponse> acquireKvSnapshotLease(
+            AcquireKvSnapshotLeaseRequest request) {
+        for (PbKvSnapshotLeaseForTable kvSnapshotLeaseForTable :
+                request.getSnapshotsToLeasesList()) {
+            long tableId = kvSnapshotLeaseForTable.getTableId();
+            if (authorizer != null) {
+                // Authorization: require WRITE permission on all tables in the request
+                authorizeTable(OperationType.READ, tableId);
+            }
+
+            validateKvTable(tableId);
+        }
+
+        String leaseId = request.getLeaseId();
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        return makeAcquireKvSnapshotLeaseResponse(
+                                kvSnapshotLeaseManager.acquireLease(
+                                        leaseId,
+                                        request.getLeaseDurationMs(),
+                                        getAcquireKvSnapshotLeaseData(request)));
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to acquire kv snapshot lease for" + leaseId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<ReleaseKvSnapshotLeaseResponse> releaseKvSnapshotLease(
+            ReleaseKvSnapshotLeaseRequest request) {
+        for (PbTableBucket tableBucket : request.getBucketsToReleasesList()) {
+            long tableId = tableBucket.getTableId();
+            if (authorizer != null) {
+                // Authorization: require WRITE permission on all tables in the request.
+                authorizeTable(OperationType.READ, tableId);
+            }
+
+            validateKvTable(tableId);
+        }
+
+        String leaseId = request.getLeaseId();
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        ReleaseKvSnapshotLeaseResponse response =
+                                new ReleaseKvSnapshotLeaseResponse();
+                        kvSnapshotLeaseManager.release(
+                                leaseId, getReleaseKvSnapshotLeaseData(request));
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to release kv snapshot lease for" + leaseId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<DropKvSnapshotLeaseResponse> dropKvSnapshotLease(
+            DropKvSnapshotLeaseRequest request) {
+        String leaseId = request.getLeaseId();
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        // Authorization: require READ permission on all tables acquired by this
+                        // lease.
+                        if (authorizer != null) {
+                            Optional<KvSnapshotLeaseHandler> leaseHandlerOpt =
+                                    kvSnapshotLeaseManager.getLease(leaseId);
+
+                            if (leaseHandlerOpt.isPresent()) {
+                                KvSnapshotLeaseHandler leaseHandler = leaseHandlerOpt.get();
+                                Set<Long> tableIds = leaseHandler.getTableIdToTableLease().keySet();
+                                // Check WRITE permission for each table.
+                                for (Long tableId : tableIds) {
+                                    authorizeTableWithSession(session, OperationType.READ, tableId);
+                                }
+                            }
+                        }
+
+                        DropKvSnapshotLeaseResponse response = new DropKvSnapshotLeaseResponse();
+                        kvSnapshotLeaseManager.dropLease(leaseId);
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to drop kv snapshot lease for" + leaseId, e);
+                    }
+                },
+                ioExecutor);
     }
 
     @Override
@@ -713,9 +1038,102 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         return future;
     }
 
+    @Override
+    public CompletableFuture<AddServerTagResponse> addServerTag(AddServerTagRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        CompletableFuture<AddServerTagResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new AddServerTagEvent(
+                                Arrays.stream(request.getServerIds())
+                                        .boxed()
+                                        .collect(Collectors.toList()),
+                                ServerTag.valueOf(request.getServerTag()),
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<RemoveServerTagResponse> removeServerTag(
+            RemoveServerTagRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+
+        CompletableFuture<RemoveServerTagResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new RemoveServerTagEvent(
+                                Arrays.stream(request.getServerIds())
+                                        .boxed()
+                                        .collect(Collectors.toList()),
+                                ServerTag.valueOf(request.getServerTag()),
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<RebalanceResponse> rebalance(RebalanceRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.WRITE, Resource.cluster());
+        }
+
+        List<Goal> goalsByPriority = new ArrayList<>();
+        Arrays.stream(request.getGoals())
+                .forEach(goal -> goalsByPriority.add(getGoalByType(GoalType.valueOf(goal))));
+
+        CompletableFuture<RebalanceResponse> response = new CompletableFuture<>();
+        eventManagerSupplier.get().put(new RebalanceEvent(goalsByPriority, response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<ListRebalanceProgressResponse> listRebalanceProgress(
+            ListRebalanceProgressRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+
+        CompletableFuture<ListRebalanceProgressResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new ListRebalanceProgressEvent(
+                                request.hasRebalanceId() ? request.getRebalanceId() : null,
+                                response));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<CancelRebalanceResponse> cancelRebalance(
+            CancelRebalanceRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.WRITE, Resource.cluster());
+        }
+
+        CompletableFuture<CancelRebalanceResponse> response = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new CancelRebalanceEvent(
+                                request.hasRebalanceId() ? request.getRebalanceId() : null,
+                                response));
+        return response;
+    }
+
     @VisibleForTesting
     public DataLakeFormat getDataLakeFormat() {
         return lakeCatalogDynamicLoader.getLakeCatalogContainer().getDataLakeFormat();
+    }
+
+    @VisibleForTesting
+    public LakeTableTieringManager getLakeTableTieringManager() {
+        return lakeTableTieringManager;
     }
 
     private void validateHeartbeatRequest(
@@ -760,11 +1178,22 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
         private final boolean isCreatingFlussTable;
         private final FlussPrincipal flussPrincipal;
+        @Nullable private final TableDescriptor currentTable;
+        private final TableDescriptor expectedTable;
 
         public DefaultLakeCatalogContext(
-                boolean isCreatingFlussTable, FlussPrincipal flussPrincipal) {
+                boolean isCreatingFlussTable,
+                FlussPrincipal flussPrincipal,
+                @Nullable TableDescriptor currentTable,
+                TableDescriptor expectedTable) {
             this.isCreatingFlussTable = isCreatingFlussTable;
             this.flussPrincipal = flussPrincipal;
+            if (!isCreatingFlussTable) {
+                checkNotNull(
+                        currentTable, "currentTable must be provided when altering a Fluss table.");
+            }
+            this.currentTable = currentTable;
+            this.expectedTable = expectedTable;
         }
 
         @Override
@@ -776,5 +1205,165 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         public FlussPrincipal getFlussPrincipal() {
             return flussPrincipal;
         }
+
+        @Nullable
+        @Override
+        public TableDescriptor getCurrentTable() {
+            return currentTable;
+        }
+
+        @Override
+        public TableDescriptor getExpectedTable() {
+            return expectedTable;
+        }
+    }
+
+    // ==================================================================================
+    // Producer Offset Management APIs (for Exactly-Once Semantics)
+    // ==================================================================================
+
+    @Override
+    public CompletableFuture<RegisterProducerOffsetsResponse> registerProducerOffsets(
+            RegisterProducerOffsetsRequest request) {
+        // Authorization: require WRITE permission on all tables in the request
+        if (authorizer != null) {
+            for (PbProducerTableOffsets tableOffsets : request.getTableOffsetsList()) {
+                long tableId = tableOffsets.getTableId();
+                authorizeTable(OperationType.WRITE, tableId);
+            }
+        }
+
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        String producerId = request.getProducerId();
+                        Map<TableBucket, Long> offsets =
+                                ServerRpcMessageUtils.toTableBucketOffsets(
+                                        request.getTableOffsetsList());
+
+                        // Use custom TTL if provided, otherwise use default (null means use
+                        // manager's default)
+                        Long ttlMs = request.hasTtlMs() ? request.getTtlMs() : null;
+
+                        // Register with atomic "check and register" semantics
+                        boolean created =
+                                producerOffsetsManager.registerSnapshot(producerId, offsets, ttlMs);
+
+                        RegisterProducerOffsetsResponse response =
+                                new RegisterProducerOffsetsResponse();
+                        // Aligns with RegisterResult enum in fluss-client:
+                        // 0 = CREATED, 1 = ALREADY_EXISTS
+                        response.setResult(created ? 0 : 1);
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to register producer offsets for producer "
+                                        + request.getProducerId(),
+                                e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<GetProducerOffsetsResponse> getProducerOffsets(
+            GetProducerOffsetsRequest request) {
+        String producerId = request.getProducerId();
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
+
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        Optional<ProducerOffsets> optSnapshot =
+                                producerOffsetsManager.getOffsetsMetadata(producerId);
+                        if (!optSnapshot.isPresent()) {
+                            return new GetProducerOffsetsResponse();
+                        }
+
+                        ProducerOffsets snapshot = optSnapshot.get();
+                        Map<TableBucket, Long> allOffsets =
+                                producerOffsetsManager.readOffsets(producerId);
+                        Map<Long, Map<TableBucket, Long>> offsetsByTable =
+                                groupOffsetsByTableId(allOffsets);
+
+                        // Authorization: filter tables by READ permission
+                        if (authorizer != null) {
+                            offsetsByTable
+                                    .keySet()
+                                    .removeIf(
+                                            tableId -> {
+                                                try {
+                                                    authorizeTableWithSession(
+                                                            session, OperationType.READ, tableId);
+                                                    return false; // keep this table
+                                                } catch (Exception e) {
+                                                    return true; // remove this table
+                                                }
+                                            });
+                        }
+
+                        GetProducerOffsetsResponse response = new GetProducerOffsetsResponse();
+                        response.setProducerId(producerId);
+                        response.setExpirationTime(snapshot.getExpirationTime());
+
+                        for (Map.Entry<Long, Map<TableBucket, Long>> entry :
+                                offsetsByTable.entrySet()) {
+                            addTableOffsetsToResponse(response, entry.getKey(), entry.getValue());
+                        }
+
+                        return response;
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to get producer offsets for producer " + producerId, e);
+                    }
+                },
+                ioExecutor);
+    }
+
+    @Override
+    public CompletableFuture<DeleteProducerOffsetsResponse> deleteProducerOffsets(
+            DeleteProducerOffsetsRequest request) {
+        // Capture session before entering async block since currentSession() is thread-local
+        Session session = authorizer != null ? currentSession() : null;
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    try {
+                        String producerId = request.getProducerId();
+
+                        // Authorization: require WRITE permission on all tables in the snapshot
+                        if (authorizer != null) {
+                            Map<TableBucket, Long> offsets =
+                                    producerOffsetsManager.readOffsets(producerId);
+                            // Extract unique table IDs from the snapshot
+                            Set<Long> tableIds =
+                                    offsets.keySet().stream()
+                                            .map(TableBucket::getTableId)
+                                            .collect(Collectors.toSet());
+                            // Check WRITE permission for each table
+                            for (Long tableId : tableIds) {
+                                authorizeTableWithSession(session, OperationType.WRITE, tableId);
+                            }
+                        }
+
+                        producerOffsetsManager.deleteSnapshot(producerId);
+                        return new DeleteProducerOffsetsResponse();
+                    } catch (ApiException e) {
+                        // Re-throw ApiExceptions as-is to preserve exception type for client
+                        throw e;
+                    } catch (Exception e) {
+                        throw new UnknownServerException(
+                                "Failed to delete producer offsets for producer "
+                                        + request.getProducerId(),
+                                e);
+                    }
+                },
+                ioExecutor);
     }
 }

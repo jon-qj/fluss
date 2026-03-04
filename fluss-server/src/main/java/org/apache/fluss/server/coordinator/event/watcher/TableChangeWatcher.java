@@ -29,16 +29,20 @@ import org.apache.fluss.server.coordinator.event.CreateTableEvent;
 import org.apache.fluss.server.coordinator.event.DropPartitionEvent;
 import org.apache.fluss.server.coordinator.event.DropTableEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
+import org.apache.fluss.server.coordinator.event.SchemaChangeEvent;
+import org.apache.fluss.server.coordinator.event.TableRegistrationChangeEvent;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.ZkData.DatabasesZNode;
 import org.apache.fluss.server.zk.data.ZkData.PartitionZNode;
+import org.apache.fluss.server.zk.data.ZkData.SchemaZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableZNode;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.recipes.cache.ChildData;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.recipes.cache.CuratorCache;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.recipes.cache.CuratorCacheListener;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -102,6 +106,14 @@ public class TableChangeWatcher {
                                         physicalTablePath.getTablePath(),
                                         physicalTablePath.getPartitionName(),
                                         newData);
+                                break;
+                            }
+
+                            Tuple2<TablePath, Integer> tablePathIntegerTuple2 =
+                                    SchemaZNode.parsePath(newData.getPath());
+                            if (tablePathIntegerTuple2 != null) {
+                                processSchemaChange(
+                                        tablePathIntegerTuple2.f0, tablePathIntegerTuple2.f1);
                             }
                         }
                         break;
@@ -116,7 +128,16 @@ public class TableChangeWatcher {
                             if (tablePath == null) {
                                 break;
                             }
-                            processCreateTable(tablePath, newData);
+                            // Distinguish between table creation and properties change.
+                            // If oldData exists and contains valid table registration data,
+                            // it's a properties change; otherwise, it's a table creation.
+                            if (oldData != null
+                                    && oldData.getData() != null
+                                    && oldData.getData().length > 0) {
+                                processTableRegistrationChange(tablePath, newData);
+                            } else {
+                                processCreateTable(tablePath, newData);
+                            }
                         }
                         break;
                     }
@@ -229,6 +250,29 @@ public class TableChangeWatcher {
             eventManager.put(
                     new CreatePartitionEvent(
                             tablePath, tableId, partitionId, partitionName, partitionAssignment));
+        }
+
+        private void processTableRegistrationChange(TablePath tablePath, ChildData newData) {
+            TableRegistration newTable = TableZNode.decode(newData.getData());
+            eventManager.put(new TableRegistrationChangeEvent(tablePath, newTable));
+        }
+    }
+
+    private void processSchemaChange(TablePath tablePath, int schemaId) {
+
+        try {
+            SchemaInfo schemaInfo;
+            Optional<SchemaInfo> optSchema = zooKeeperClient.getSchemaById(tablePath, schemaId);
+            if (!optSchema.isPresent()) {
+                LOG.error("No schema for table {} in zookeeper.", tablePath);
+                return;
+            } else {
+                schemaInfo = optSchema.get();
+            }
+
+            eventManager.put(new SchemaChangeEvent(tablePath, schemaInfo));
+        } catch (Exception e) {
+            LOG.error("Fail to get current schema id for table {}.", tablePath, e);
         }
     }
 }

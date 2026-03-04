@@ -17,7 +17,9 @@
 
 package org.apache.fluss.server.testutils;
 
+import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.metadata.PartitionSpec;
+import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
@@ -25,6 +27,7 @@ import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.bytesview.MemorySegmentBytesView;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
@@ -46,6 +49,7 @@ import org.apache.fluss.rpc.messages.ListPartitionInfosRequest;
 import org.apache.fluss.rpc.messages.ListTablesRequest;
 import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.MetadataRequest;
+import org.apache.fluss.rpc.messages.PbAddColumn;
 import org.apache.fluss.rpc.messages.PbAlterConfig;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForBucket;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForTable;
@@ -72,9 +76,11 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.testutils.DataTestUtils.assertMemoryRecordsEqualsWithRowKind;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -142,9 +148,29 @@ public class RpcMessageTestUtils {
     }
 
     public static AlterTableRequest newAlterTableRequest(
-            TablePath tablePath, List<PbAlterConfig> alterConfigs, boolean ignoreIfExists) {
+            TablePath tablePath,
+            Map<String, String> setProperties,
+            List<String> resetProperties,
+            List<PbAddColumn> addColumns,
+            boolean ignoreIfExists) {
+        List<PbAlterConfig> alterConfigs = new ArrayList<>();
+        for (Map.Entry<String, String> entry : setProperties.entrySet()) {
+            PbAlterConfig info = new PbAlterConfig();
+            info.setConfigKey(entry.getKey());
+            info.setConfigValue(entry.getValue());
+            info.setOpType(AlterConfigOpType.SET.value());
+            alterConfigs.add(info);
+        }
+        for (String resetProperty : resetProperties) {
+            PbAlterConfig info = new PbAlterConfig();
+            info.setConfigKey(resetProperty);
+            info.setOpType(AlterConfigOpType.DELETE.value());
+            alterConfigs.add(info);
+        }
+
         AlterTableRequest request = new AlterTableRequest();
         request.addAllConfigChanges(alterConfigs)
+                .addAllAddColumns(addColumns)
                 .setIgnoreIfNotExists(ignoreIfExists)
                 .setTablePath()
                 .setDatabaseName(tablePath.getDatabaseName())
@@ -258,6 +284,27 @@ public class RpcMessageTestUtils {
         return lookupRequest;
     }
 
+    public static LookupRequest newLookupRequest(
+            long tableId,
+            int bucketId,
+            boolean insertIfNotExists,
+            int timeoutMs,
+            int acks,
+            byte[]... keys) {
+        LookupRequest lookupRequest =
+                new LookupRequest()
+                        .setTableId(tableId)
+                        .setInsertIfNotExists(insertIfNotExists)
+                        .setTimeoutMs(timeoutMs)
+                        .setAcks(acks);
+        PbLookupReqForBucket pbLookupReqForBucket = lookupRequest.addBucketsReq();
+        pbLookupReqForBucket.setBucketId(bucketId);
+        for (byte[] key : keys) {
+            pbLookupReqForBucket.addKey(key);
+        }
+        return lookupRequest;
+    }
+
     public static PrefixLookupRequest newPrefixLookupRequest(
             long tableId, int bucketId, List<byte[]> prefixKeys) {
         PrefixLookupRequest prefixLookupRequest = new PrefixLookupRequest().setTableId(tableId);
@@ -361,6 +408,22 @@ public class RpcMessageTestUtils {
         return response.getTableId();
     }
 
+    public static void dropTable(FlussClusterExtension extension, TablePath tablePath)
+            throws Exception {
+        CoordinatorGateway coordinatorGateway = extension.newCoordinatorClient();
+        coordinatorGateway
+                .dropTable(
+                        newDropTableRequest(
+                                tablePath.getDatabaseName(), tablePath.getTableName(), true))
+                .get();
+    }
+
+    public static void dropDatabase(FlussClusterExtension extension, String databaseName)
+            throws Exception {
+        CoordinatorGateway coordinatorGateway = extension.newCoordinatorClient();
+        coordinatorGateway.dropDatabase(newDropDatabaseRequest(databaseName, true, true)).get();
+    }
+
     public static void assertProduceLogResponse(
             ProduceLogResponse produceLogResponse, int bucketId, Long baseOffset) {
         assertThat(produceLogResponse.getBucketsRespsCount()).isEqualTo(1);
@@ -380,12 +443,19 @@ public class RpcMessageTestUtils {
             Long highWatermark,
             List<Object[]> expectedRecords) {
         assertFetchLogResponse(
-                response, DATA1_ROW_TYPE, tableId, bucketId, highWatermark, expectedRecords);
+                response,
+                DATA1_ROW_TYPE,
+                new TestingSchemaGetter(1, DATA1_SCHEMA),
+                tableId,
+                bucketId,
+                highWatermark,
+                expectedRecords);
     }
 
     public static void assertFetchLogResponse(
             FetchLogResponse response,
-            RowType rowType,
+            RowType expectedRowType,
+            SchemaGetter schemaGetter,
             long tableId,
             long bucketId,
             Long highWatermark,
@@ -396,7 +466,8 @@ public class RpcMessageTestUtils {
                         .collect(Collectors.toList());
         assertFetchLogResponse(
                 response,
-                rowType,
+                expectedRowType,
+                schemaGetter,
                 tableId,
                 bucketId,
                 highWatermark,
@@ -414,6 +485,7 @@ public class RpcMessageTestUtils {
         assertFetchLogResponse(
                 response,
                 DATA1_ROW_TYPE,
+                new TestingSchemaGetter(1, DATA1_SCHEMA),
                 tableId,
                 bucketId,
                 highWatermark,
@@ -431,6 +503,7 @@ public class RpcMessageTestUtils {
         assertFetchLogResponse(
                 response,
                 DATA1_ROW_TYPE,
+                new TestingSchemaGetter(1, DATA1_SCHEMA),
                 tableId,
                 bucketId,
                 -1L,
@@ -441,7 +514,8 @@ public class RpcMessageTestUtils {
 
     private static void assertFetchLogResponse(
             FetchLogResponse response,
-            RowType rowType,
+            RowType expectedRowType,
+            SchemaGetter schemaGetter,
             long tableId,
             long bucketId,
             Long highWatermark,
@@ -465,12 +539,18 @@ public class RpcMessageTestUtils {
             MemoryLogRecords resultRecords =
                     MemoryLogRecords.pointToBytes(protoFetchedBucket.getRecords());
             assertMemoryRecordsEqualsWithRowKind(
-                    rowType, resultRecords, Collections.singletonList(expectedRecords));
+                    expectedRowType,
+                    schemaGetter,
+                    resultRecords,
+                    Collections.singletonList(expectedRecords));
         }
     }
 
     public static void assertLimitScanResponse(
-            LimitScanResponse limitScanResponse, RowType rowType, List<Object[]> expectedRecords) {
+            LimitScanResponse limitScanResponse,
+            RowType expectedRowType,
+            SchemaGetter schemaGetter,
+            List<Object[]> expectedRecords) {
         List<Tuple2<ChangeType, Object[]>> expectedFieldAndRowKind =
                 expectedRecords.stream()
                         .map(val -> Tuple2.of(ChangeType.APPEND_ONLY, val))
@@ -478,7 +558,10 @@ public class RpcMessageTestUtils {
         MemoryLogRecords resultRecords =
                 MemoryLogRecords.pointToBytes(limitScanResponse.getRecords());
         assertMemoryRecordsEqualsWithRowKind(
-                rowType, resultRecords, Collections.singletonList(expectedFieldAndRowKind));
+                expectedRowType,
+                schemaGetter,
+                resultRecords,
+                Collections.singletonList(expectedFieldAndRowKind));
     }
 
     public static void assertLimitScanResponse(

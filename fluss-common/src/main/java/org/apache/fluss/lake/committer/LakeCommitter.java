@@ -37,6 +37,12 @@ import java.util.Map;
 public interface LakeCommitter<WriteResult, CommittableT> extends AutoCloseable {
 
     /**
+     * The property key used to store the file path of lake table bucket offsets in snapshot
+     * properties.
+     */
+    String FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY = "fluss-offsets";
+
+    /**
      * Converts a list of write results to a committable object.
      *
      * @param writeResults the list of write results
@@ -50,10 +56,13 @@ public interface LakeCommitter<WriteResult, CommittableT> extends AutoCloseable 
      *
      * @param committable the committable object
      * @param snapshotProperties the properties that lake supported to store in snapshot
-     * @return the committed snapshot ID
+     * @return the commit result, which always includes the latest committed snapshot ID and may
+     *     optionally contain distinct readable snapshot information if the physical tiered offsets
+     *     do not yet represent a consistent readable state (e.g., in Paimon DV tables where the
+     *     tiered log records may still in level0 which is not readable).
      * @throws IOException if an I/O error occurs
      */
-    long commit(CommittableT committable, Map<String, String> snapshotProperties)
+    LakeCommitResult commit(CommittableT committable, Map<String, String> snapshotProperties)
             throws IOException;
 
     /**

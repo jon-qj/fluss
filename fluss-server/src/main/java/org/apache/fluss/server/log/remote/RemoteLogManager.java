@@ -38,6 +38,7 @@ import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.Closeable;
@@ -83,13 +84,14 @@ public class RemoteLogManager implements Closeable {
             Configuration conf,
             ZooKeeperClient zkClient,
             CoordinatorGateway coordinatorGateway,
-            Clock clock)
+            Clock clock,
+            ExecutorService ioExecutor)
             throws IOException {
         this(
                 conf,
                 zkClient,
                 coordinatorGateway,
-                new DefaultRemoteLogStorage(conf),
+                new DefaultRemoteLogStorage(conf, ioExecutor),
                 Executors.newScheduledThreadPool(
                         conf.getInt(ConfigOptions.REMOTE_LOG_MANAGER_THREAD_POOL_SIZE),
                         new ExecutorThreadFactory(RLM_SCHEDULED_THREAD_PREFIX)),
@@ -304,7 +306,7 @@ public class RemoteLogManager implements Closeable {
     }
 
     @VisibleForTesting
-    RemoteLogTablet remoteLogTablet(TableBucket tableBucket) {
+    public RemoteLogTablet remoteLogTablet(TableBucket tableBucket) {
         RemoteLogTablet remoteLog = remoteLogs.get(tableBucket);
         if (remoteLog == null) {
             throw new IllegalStateException(
@@ -385,5 +387,11 @@ public class RemoteLogManager implements Closeable {
     @VisibleForTesting
     public RemoteLogIndexCache getRemoteLogIndexCache() {
         return remoteLogIndexCache;
+    }
+
+    @VisibleForTesting
+    @Nullable
+    TaskWithFuture getTaskWithFuture(TableBucket tableBucket) {
+        return rlmTasks.get(tableBucket);
     }
 }

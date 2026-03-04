@@ -24,6 +24,7 @@ import org.apache.fluss.client.table.scanner.RemoteFileDownloader;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.WakeupException;
+import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -82,7 +83,8 @@ public class LogScannerImpl implements LogScanner {
             MetadataUpdater metadataUpdater,
             ClientMetricGroup clientMetricGroup,
             RemoteFileDownloader remoteFileDownloader,
-            @Nullable int[] projectedFields) {
+            @Nullable int[] projectedFields,
+            SchemaGetter schemaGetter) {
         this.tablePath = tableInfo.getTablePath();
         this.tableId = tableInfo.getTableId();
         this.isPartitionedTable = tableInfo.isPartitioned();
@@ -100,7 +102,8 @@ public class LogScannerImpl implements LogScanner {
                         conf,
                         metadataUpdater,
                         scannerMetricGroup,
-                        remoteFileDownloader);
+                        remoteFileDownloader,
+                        schemaGetter);
     }
 
     /**
@@ -216,6 +219,23 @@ public class LogScannerImpl implements LogScanner {
         acquireAndEnsureOpen();
         try {
             TableBucket tableBucket = new TableBucket(tableId, partitionId, bucket);
+            this.logScannerStatus.unassignScanBuckets(Collections.singletonList(tableBucket));
+        } finally {
+            release();
+        }
+    }
+
+    @Override
+    public void unsubscribe(int bucket) {
+        if (isPartitionedTable) {
+            throw new IllegalStateException(
+                    "The table is a partitioned table, please use "
+                            + "\"unsubscribe(long partitionId, int bucket)\" to "
+                            + "unsubscribe a partitioned bucket instead.");
+        }
+        acquireAndEnsureOpen();
+        try {
+            TableBucket tableBucket = new TableBucket(tableId, bucket);
             this.logScannerStatus.unassignScanBuckets(Collections.singletonList(tableBucket));
         } finally {
             release();

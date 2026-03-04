@@ -19,8 +19,12 @@ package org.apache.fluss.server.zk;
 
 import org.apache.fluss.cluster.Endpoint;
 import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.cluster.rebalance.RebalancePlanForBucket;
+import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
@@ -33,11 +37,15 @@ import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.RebalanceTask;
+import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
+import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
 import org.apache.fluss.shaded.curator5.org.apache.curator.CuratorZookeeperClient;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFramework;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.ZooKeeper;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.client.ZKClientConfig;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
@@ -62,6 +70,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.cluster.rebalance.RebalanceStatus.COMPLETED;
+import static org.apache.fluss.cluster.rebalance.RebalanceStatus.NOT_STARTED;
 import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -386,7 +396,7 @@ class ZooKeeperClientTest {
                         .withComment("c is third column")
                         .primaryKey("a")
                         .build();
-        int registeredSchemaId = zookeeperClient.registerSchema(tablePath, schema);
+        int registeredSchemaId = zookeeperClient.registerFirstSchema(tablePath, schema);
         assertThat(registeredSchemaId).isEqualTo(schemaId);
         assertThat(zookeeperClient.getCurrentSchemaId(tablePath)).isEqualTo(schemaId);
 
@@ -405,7 +415,7 @@ class ZooKeeperClientTest {
                         .withComment("b is second column")
                         .primaryKey("a")
                         .build();
-        registeredSchemaId = zookeeperClient.registerSchema(tablePath, schema2);
+        registeredSchemaId = zookeeperClient.registerSchema(tablePath, schema2, 2);
         assertThat(registeredSchemaId).isEqualTo(2);
         assertThat(zookeeperClient.getCurrentSchemaId(tablePath)).isEqualTo(2);
 
@@ -413,6 +423,10 @@ class ZooKeeperClientTest {
         assertThat(schemaInfo.isPresent()).isTrue();
         assertThat(schemaInfo.get().getSchema()).isEqualTo(schema2);
         assertThat(schemaInfo.get().getSchemaId()).isEqualTo(2);
+
+        // test register schema with existed schemaId
+        assertThatThrownBy(() -> zookeeperClient.registerSchema(tablePath, schema2, 2))
+                .isExactlyInstanceOf(KeeperException.NodeExistsException.class);
     }
 
     @Test
@@ -475,6 +489,36 @@ class ZooKeeperClientTest {
         zookeeperClient.deleteTableBucketSnapshot(table1Bucket2, 2);
         assertThat(zookeeperClient.getTableBucketAllSnapshotAndIds(table1Bucket2)).isEmpty();
         assertThat(zookeeperClient.getTableBucketSnapshot(table1Bucket2, 1)).isEmpty();
+    }
+
+    @Test
+    void testKvSnapshotLease() throws Exception {
+        Map<Long, FsPath> tableIdToRemotePath = new HashMap<>();
+        tableIdToRemotePath.put(150002L, new FsPath("/test/cp1"));
+        KvSnapshotLeaseMetadata leaseMetadata =
+                new KvSnapshotLeaseMetadata(1000L, tableIdToRemotePath);
+
+        assertThat(zookeeperClient.getKvSnapshotLeasesList()).isEmpty();
+        zookeeperClient.registerKvSnapshotLeaseMetadata("lease1", leaseMetadata);
+        assertThat(zookeeperClient.getKvSnapshotLeasesList()).containsExactly("lease1");
+
+        Optional<KvSnapshotLeaseMetadata> metadataOpt =
+                zookeeperClient.getKvSnapshotLeaseMetadata("lease1");
+        assertThat(metadataOpt.isPresent()).isTrue();
+        assertThat(metadataOpt.get()).isEqualTo(leaseMetadata);
+
+        tableIdToRemotePath = new HashMap<>();
+        tableIdToRemotePath.put(150002L, new FsPath("/test/cp2"));
+        leaseMetadata = new KvSnapshotLeaseMetadata(1000L, tableIdToRemotePath);
+        zookeeperClient.updateKvSnapshotLeaseMetadata("lease1", leaseMetadata);
+
+        metadataOpt = zookeeperClient.getKvSnapshotLeaseMetadata("lease1");
+        assertThat(metadataOpt.isPresent()).isTrue();
+        assertThat(metadataOpt.get()).isEqualTo(leaseMetadata);
+
+        zookeeperClient.deleteKvSnapshotLease("lease1");
+        metadataOpt = zookeeperClient.getKvSnapshotLeaseMetadata("lease1");
+        assertThat(metadataOpt).isNotPresent();
     }
 
     @Test
@@ -548,6 +592,86 @@ class ZooKeeperClientTest {
     }
 
     @Test
+    void testServerTag() throws Exception {
+        Map<Integer, ServerTag> serverTags = new HashMap<>();
+        serverTags.put(0, ServerTag.PERMANENT_OFFLINE);
+        serverTags.put(1, ServerTag.TEMPORARY_OFFLINE);
+
+        zookeeperClient.registerServerTags(new ServerTags(serverTags));
+        assertThat(zookeeperClient.getServerTags()).hasValue(new ServerTags(serverTags));
+
+        // update server tags.
+        serverTags.put(0, ServerTag.TEMPORARY_OFFLINE);
+        serverTags.remove(1);
+        zookeeperClient.updateServerTags(new ServerTags(serverTags));
+        assertThat(zookeeperClient.getServerTags()).hasValue(new ServerTags(serverTags));
+
+        zookeeperClient.updateServerTags(new ServerTags(Collections.emptyMap()));
+        assertThat(zookeeperClient.getServerTags())
+                .hasValue(new ServerTags(Collections.emptyMap()));
+    }
+
+    @Test
+    void testRebalancePlan() throws Exception {
+        Map<TableBucket, RebalancePlanForBucket> bucketPlan = new HashMap<>();
+        bucketPlan.put(
+                new TableBucket(0L, 0),
+                new RebalancePlanForBucket(
+                        new TableBucket(0L, 0),
+                        0,
+                        3,
+                        Arrays.asList(0, 1, 2),
+                        Arrays.asList(3, 4, 5)));
+        bucketPlan.put(
+                new TableBucket(0L, 1),
+                new RebalancePlanForBucket(
+                        new TableBucket(0L, 1),
+                        1,
+                        1,
+                        Arrays.asList(0, 1, 2),
+                        Arrays.asList(1, 2, 3)));
+        bucketPlan.put(
+                new TableBucket(1L, 1L, 0),
+                new RebalancePlanForBucket(
+                        new TableBucket(1L, 1L, 0),
+                        1,
+                        1,
+                        Arrays.asList(0, 1, 2),
+                        Arrays.asList(1, 2, 3)));
+        bucketPlan.put(
+                new TableBucket(1L, 1L, 1),
+                new RebalancePlanForBucket(
+                        new TableBucket(1L, 1L, 1),
+                        1,
+                        1,
+                        Arrays.asList(0, 1, 2),
+                        Arrays.asList(1, 2, 3)));
+        zookeeperClient.registerRebalanceTask(
+                new RebalanceTask("rebalance-task-1", NOT_STARTED, bucketPlan));
+        assertThat(zookeeperClient.getRebalanceTask())
+                .hasValue(new RebalanceTask("rebalance-task-1", NOT_STARTED, bucketPlan));
+
+        bucketPlan = new HashMap<>();
+        bucketPlan.put(
+                new TableBucket(0L, 0),
+                new RebalancePlanForBucket(
+                        new TableBucket(0L, 0),
+                        0,
+                        3,
+                        Arrays.asList(0, 1, 2),
+                        Arrays.asList(3, 4, 5)));
+        zookeeperClient.registerRebalanceTask(
+                new RebalanceTask("rebalance-task-2", NOT_STARTED, bucketPlan));
+        assertThat(zookeeperClient.getRebalanceTask())
+                .hasValue(new RebalanceTask("rebalance-task-2", NOT_STARTED, bucketPlan));
+
+        zookeeperClient.registerRebalanceTask(
+                new RebalanceTask("rebalance-task-2", COMPLETED, bucketPlan));
+        assertThat(zookeeperClient.getRebalanceTask())
+                .hasValue(new RebalanceTask("rebalance-task-2", COMPLETED, bucketPlan));
+    }
+
+    @Test
     void testZookeeperConfigPath() throws Exception {
         final Configuration config = new Configuration();
         config.setString(
@@ -575,5 +699,41 @@ class ZooKeeperClientTest {
             assertThat(clientConfig.getProperty(ZKClientConfig.ZK_SASL_CLIENT_USERNAME))
                     .isEqualTo("zookeeper2");
         }
+    }
+
+    @Test
+    void testGetDatabaseSummary() throws Exception {
+        TablePath tablePath = TablePath.of("db", "tb1");
+
+        assertThat(
+                        zookeeperClient.listDatabaseSummaries(
+                                Collections.singletonList(tablePath.getDatabaseName())))
+                .isEmpty();
+
+        // register table.
+        long beforeCreateTime = System.currentTimeMillis();
+        TableRegistration tableReg1 =
+                new TableRegistration(
+                        11,
+                        "first table",
+                        Arrays.asList("a", "b"),
+                        new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        beforeCreateTime,
+                        beforeCreateTime);
+        zookeeperClient.registerTable(tablePath, tableReg1);
+
+        long afterCreateTime = System.currentTimeMillis();
+        List<DatabaseSummary> databaseSummaries =
+                zookeeperClient.listDatabaseSummaries(
+                        Collections.singletonList(tablePath.getDatabaseName()));
+        assertThat(databaseSummaries).hasSize(1);
+        DatabaseSummary databaseSummary = databaseSummaries.get(0);
+        assertThat(databaseSummary.getDatabaseName()).isEqualTo("db");
+        assertThat(databaseSummary.getTableCount()).isEqualTo(1);
+        assertThat(databaseSummary.getCreatedTime())
+                .isGreaterThanOrEqualTo(beforeCreateTime)
+                .isLessThanOrEqualTo(afterCreateTime);
     }
 }

@@ -28,6 +28,7 @@ import org.apache.fluss.record.bytesview.BytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.rpc.protocol.MergeMode;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
@@ -50,6 +51,8 @@ public class KvWriteBatch extends WriteBatch {
     private final AbstractPagedOutputView outputView;
     private final KvRecordBatchBuilder recordsBuilder;
     private final @Nullable int[] targetColumns;
+    private final int schemaId;
+    private final MergeMode mergeMode;
 
     public KvWriteBatch(
             int bucketId,
@@ -59,16 +62,31 @@ public class KvWriteBatch extends WriteBatch {
             int writeLimit,
             AbstractPagedOutputView outputView,
             @Nullable int[] targetColumns,
+            MergeMode mergeMode,
             long createdMs) {
         super(bucketId, physicalTablePath, createdMs);
         this.outputView = outputView;
         this.recordsBuilder =
                 KvRecordBatchBuilder.builder(schemaId, writeLimit, outputView, kvFormat);
         this.targetColumns = targetColumns;
+        this.schemaId = schemaId;
+        this.mergeMode = mergeMode;
+    }
+
+    @Override
+    public boolean isLogBatch() {
+        return false;
     }
 
     @Override
     public boolean tryAppend(WriteRecord writeRecord, WriteCallback callback) throws Exception {
+        if (schemaId != writeRecord.getSchemaId()) {
+            throw new IllegalStateException(
+                    String.format(
+                            "schema id %d of the write record to append is not the same as the current schema id %d in the batch.",
+                            writeRecord.getSchemaId(), schemaId));
+        }
+
         // currently, we throw exception directly when the target columns of the write record is
         // not the same as the current target columns in the batch.
         // this should be quite fast as they should be the same objects.
@@ -78,6 +96,16 @@ public class KvWriteBatch extends WriteBatch {
                             "target columns %s of the write record to append are not the same as the current target columns %s in the batch.",
                             Arrays.toString(writeRecord.getTargetColumns()),
                             Arrays.toString(targetColumns)));
+        }
+
+        // Validate mergeMode consistency - records with different mergeMode cannot be batched
+        // together
+        if (writeRecord.getMergeMode() != this.mergeMode) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Cannot mix records with different mergeMode in the same batch. "
+                                    + "Batch mergeMode: %s, Record mergeMode: %s",
+                            this.mergeMode, writeRecord.getMergeMode()));
         }
 
         byte[] key = writeRecord.getKey();
@@ -97,6 +125,10 @@ public class KvWriteBatch extends WriteBatch {
     @Nullable
     public int[] getTargetColumns() {
         return targetColumns;
+    }
+
+    public MergeMode getMergeMode() {
+        return mergeMode;
     }
 
     @Override
@@ -149,6 +181,7 @@ public class KvWriteBatch extends WriteBatch {
         recordsBuilder.abort();
     }
 
+    @Override
     public void resetWriterState(long writerId, int batchSequence) {
         super.resetWriterState(writerId, batchSequence);
         recordsBuilder.resetWriterState(writerId, batchSequence);

@@ -22,16 +22,15 @@ import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.table.getter.PartitionGetter;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.DataLakeFormat;
+import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.decode.RowDecoder;
 import org.apache.fluss.row.encode.KeyEncoder;
-import org.apache.fluss.row.encode.ValueDecoder;
-import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.NotThreadSafe;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,16 +45,14 @@ import static org.apache.fluss.client.utils.ClientUtils.getPartitionId;
  * An implementation of {@link Lookuper} that lookups by prefix key. A prefix key is a prefix subset
  * of the primary key.
  */
-class PrefixKeyLookuper implements Lookuper {
+@NotThreadSafe
+class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
 
-    private final TableInfo tableInfo;
-
-    private final MetadataUpdater metadataUpdater;
-
-    private final LookupClient lookupClient;
-
-    /** Extract bucket key from prefix lookup key row. */
+    /** Encode bucket key from prefix lookup key row. */
     private final KeyEncoder bucketKeyEncoder;
+
+    /** Encode prefix key for prefix lookup (follows primary key encoding rules). */
+    private final KeyEncoder prefixKeyEncoder;
 
     private final BucketingFunction bucketingFunction;
     private final int numBuckets;
@@ -65,36 +62,43 @@ class PrefixKeyLookuper implements Lookuper {
      */
     private @Nullable final PartitionGetter partitionGetter;
 
-    /** Decode the lookup bytes to result row. */
-    private final ValueDecoder kvValueDecoder;
-
     public PrefixKeyLookuper(
             TableInfo tableInfo,
+            SchemaGetter schemaGetter,
             MetadataUpdater metadataUpdater,
             LookupClient lookupClient,
             List<String> lookupColumnNames) {
+        super(tableInfo, metadataUpdater, lookupClient, schemaGetter);
         // sanity check
         validatePrefixLookup(tableInfo, lookupColumnNames);
-        // initialization
-        this.tableInfo = tableInfo;
         this.numBuckets = tableInfo.getNumBuckets();
-        this.metadataUpdater = metadataUpdater;
-        this.lookupClient = lookupClient;
         // the row type of the input lookup row
         RowType lookupRowType = tableInfo.getRowType().project(lookupColumnNames);
         DataLakeFormat lakeFormat = tableInfo.getTableConfig().getDataLakeFormat().orElse(null);
 
-        this.bucketKeyEncoder = KeyEncoder.of(lookupRowType, tableInfo.getBucketKeys(), lakeFormat);
+        // Use ofPrimaryKeyEncoder which follows primary key encoding rules
+        this.prefixKeyEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        lookupRowType,
+                        // bucket keys are prefix keys
+                        tableInfo.getBucketKeys(),
+                        tableInfo.getTableConfig(),
+                        tableInfo.isDefaultBucketKey());
+
+        this.bucketKeyEncoder =
+                lakeFormat == null
+                        // if lake format is null, don't need need to use lake format bucket
+                        // encoder,
+                        // we can just use the prefixKeyEncoder
+                        ? this.prefixKeyEncoder
+                        : KeyEncoder.ofBucketKeyEncoder(
+                                lookupRowType, tableInfo.getBucketKeys(), lakeFormat);
+
         this.bucketingFunction = BucketingFunction.of(lakeFormat);
         this.partitionGetter =
                 tableInfo.isPartitioned()
                         ? new PartitionGetter(lookupRowType, tableInfo.getPartitionKeys())
                         : null;
-        this.kvValueDecoder =
-                new ValueDecoder(
-                        RowDecoder.create(
-                                tableInfo.getTableConfig().getKvFormat(),
-                                tableInfo.getRowType().getChildren().toArray(new DataType[0])));
     }
 
     private void validatePrefixLookup(TableInfo tableInfo, List<String> lookupColumns) {
@@ -143,11 +147,24 @@ class PrefixKeyLookuper implements Lookuper {
                                     + "because the lookup columns %s must contain all bucket keys %s in order.",
                             tableInfo.getTablePath(), lookupColumns, bucketKeys));
         }
+
+        if (bucketKeys.equals(physicalPrimaryKeys)) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Can not perform prefix lookup on table '%s', "
+                                    + "because the lookup columns %s equals the physical primary keys %s. "
+                                    + "Please use primary key lookup (Lookuper without lookupBy) instead.",
+                            tableInfo.getTablePath(), lookupColumns, physicalPrimaryKeys));
+        }
     }
 
     @Override
     public CompletableFuture<LookupResult> lookup(InternalRow prefixKey) {
-        byte[] bucketKeyBytes = bucketKeyEncoder.encodeKey(prefixKey);
+        byte[] prefixKeyBytes = prefixKeyEncoder.encodeKey(prefixKey);
+        byte[] bucketKeyBytes =
+                prefixKeyEncoder == bucketKeyEncoder
+                        ? prefixKeyBytes
+                        : bucketKeyEncoder.encodeKey(prefixKey);
         int bucketId = bucketingFunction.bucketing(bucketKeyBytes, numBuckets);
 
         Long partitionId = null;
@@ -164,19 +181,22 @@ class PrefixKeyLookuper implements Lookuper {
             }
         }
 
+        CompletableFuture<LookupResult> lookupFuture = new CompletableFuture<>();
         TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-        return lookupClient
-                .prefixLookup(tableBucket, bucketKeyBytes)
-                .thenApply(
-                        result -> {
-                            List<InternalRow> rowList = new ArrayList<>(result.size());
-                            for (byte[] valueBytes : result) {
-                                if (valueBytes == null) {
-                                    continue;
-                                }
-                                rowList.add(kvValueDecoder.decodeValue(valueBytes).row);
+        lookupClient
+                .prefixLookup(tableInfo.getTablePath(), tableBucket, prefixKeyBytes)
+                .whenComplete(
+                        (result, error) -> {
+                            if (error != null) {
+                                lookupFuture.completeExceptionally(
+                                        new RuntimeException(
+                                                "Failed to perform prefix lookup for table: "
+                                                        + tableInfo.getTablePath(),
+                                                error));
+                            } else {
+                                handleLookupResponse(result, lookupFuture);
                             }
-                            return new LookupResult(rowList);
                         });
+        return lookupFuture;
     }
 }

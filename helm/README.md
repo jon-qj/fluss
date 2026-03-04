@@ -30,7 +30,7 @@ It requires a Zookeeper ensemble to be running in the same Kubernetes cluster. I
 | [Minikube](https://minikube.sigs.k8s.io/docs/)                                 | v1.36.0 |
 | [Kubernetes](https://kubernetes.io)                                            | v1.25.3 |
 | [Helm](https://helm.sh)                                                        | v3.18.6 |
-| [Apache Fluss](https://fluss.apache.org/docs/)                                 | v0.9.0-incubating  |
+| [Apache Fluss](https://fluss.apache.org/docs/)                                 | v0.10.0-incubating  |
 
 
 ## Image requirements 
@@ -43,7 +43,7 @@ In minikube, you can use the local Docker daemon to build the image without push
 
 ```bash
 eval $(minikube -p minikube docker-env)
-docker build -t fluss/fluss:0.9.0-incubating .
+docker build -t fluss/fluss:0.10.0-incubating .
 ```
 
 ## Overview
@@ -97,6 +97,20 @@ Important Fluss options surfaced by the chart:
 ### Zookeeper and storage
 - zookeeper.address must point to a reachable ensemble.
 - data.dir defaults to /tmp/fluss/data; use a PVC if persistence.enabled=true.
+
+### Private Docker Registry
+
+If you are pulling the Fluss image from a private Docker registry, you can configure the chart using `image.registry` and `image.pullSecrets`.
+
+#### Image values reference
+
+| Parameter            | Description                              | Default             |
+| -------------------- |------------------------------------------|---------------------|
+| `image.registry`     | Docker image registry                    | `""`                |
+| `image.repository`   | Docker image repository                  | `apache/fluss`      |
+| `image.pullPolicy`   | Image pull policy                        | `IfNotPresent`      |
+| `image.pullSecrets`  | Docker registry secret names as an array | `[]`                |
+
 
 ## Resource management
 

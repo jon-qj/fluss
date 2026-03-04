@@ -47,9 +47,11 @@ import org.apache.fluss.server.authorizer.DefaultAuthorizer;
 import org.apache.fluss.server.coordinator.CoordinatorServer;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
+import org.apache.fluss.server.coordinator.rebalance.RebalanceManager;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandle;
+import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.replica.Replica;
@@ -64,7 +66,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.TableAssignment;
-import org.apache.fluss.utils.FileUtils;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 
@@ -80,7 +82,6 @@ import javax.annotation.Nullable;
 
 import java.io.File;
 import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -91,8 +92,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newDropDatabaseRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newDropTableRequest;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeNotifyBucketLeaderAndIsr;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeStopBucketReplica;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toServerNode;
@@ -100,8 +104,10 @@ import static org.apache.fluss.server.zk.ZooKeeperTestUtils.createZooKeeperClien
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.function.FunctionUtils.uncheckedFunction;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 
 /**
  * A Junit {@link Extension} which starts a Fluss Cluster.
@@ -130,6 +136,7 @@ public final class FlussClusterExtension
     private final Map<Integer, ServerInfo> tabletServerInfos;
     private final Configuration clusterConf;
     private final Clock clock;
+    private final String[] racks;
 
     /** Creates a new {@link Builder} for {@link FlussClusterExtension}. */
     public static Builder builder() {
@@ -141,7 +148,8 @@ public final class FlussClusterExtension
             String coordinatorServerListeners,
             String tabletServerListeners,
             Configuration clusterConf,
-            Clock clock) {
+            Clock clock,
+            String[] racks) {
         this.initialNumOfTabletServers = numOfTabletServers;
         this.tabletServers = new HashMap<>(numOfTabletServers);
         this.coordinatorServerListeners = coordinatorServerListeners;
@@ -149,6 +157,10 @@ public final class FlussClusterExtension
         this.tabletServerInfos = new HashMap<>();
         this.clusterConf = clusterConf;
         this.clock = clock;
+        checkArgument(
+                racks != null && racks.length == numOfTabletServers,
+                "racks must be not null and have the same length as numOfTabletServers");
+        this.racks = racks;
     }
 
     @Override
@@ -168,33 +180,25 @@ public final class FlussClusterExtension
 
     @Override
     public void afterEach(ExtensionContext extensionContext) throws Exception {
-        String defaultDb = BUILTIN_DATABASE;
-        // TODO: we need to cleanup all zk nodes, including the assignments,
-        //  but currently, we don't have a good way to do it
-        if (metadataManager != null) {
-            // drop all database and tables.
-            List<String> databases = metadataManager.listDatabases();
-            for (String database : databases) {
-                if (!database.equals(defaultDb)) {
-                    metadataManager.dropDatabase(database, true, true);
-                    // delete the data dirs
-                    for (int serverId : tabletServers.keySet()) {
-                        String dataDir = getDataDir(serverId);
-                        FileUtils.deleteDirectoryQuietly(Paths.get(dataDir, database).toFile());
-                    }
+        List<String> dbs = metadataManager.listDatabases();
+        CoordinatorGateway coordinatorGateway = newCoordinatorClient();
+        List<CompletableFuture<?>> dropFutures = new ArrayList<>();
+        for (String db : dbs) {
+            if (BUILTIN_DATABASE.equals(db)) {
+                // if it's built-in database, we just drop all tables in it but not drop the
+                // database itself.
+                List<String> tables = metadataManager.listTables(BUILTIN_DATABASE);
+                for (String table : tables) {
+                    dropFutures.add(
+                            coordinatorGateway.dropTable(
+                                    newDropTableRequest(BUILTIN_DATABASE, table, true)));
                 }
-            }
-            List<String> tables = metadataManager.listTables(defaultDb);
-            for (String table : tables) {
-                metadataManager.dropTable(TablePath.of(defaultDb, table), true);
+            } else {
+                dropFutures.add(
+                        coordinatorGateway.dropDatabase(newDropDatabaseRequest(db, true, true)));
             }
         }
-
-        // TODO we need to drop these table by dropTable Event instead of manual clear table
-        // metadata.
-        for (TabletServer tabletServer : tabletServers.values()) {
-            tabletServer.getMetadataCache().clearTableMetadata();
-        }
+        CompletableFuture.allOf(dropFutures.toArray(new CompletableFuture[0])).join();
     }
 
     public void start() throws Exception {
@@ -257,7 +261,7 @@ public final class FlussClusterExtension
             conf.setString(ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
             conf.setString(ConfigOptions.BIND_LISTENERS, coordinatorServerListeners);
             setRemoteDataDir(conf);
-            coordinatorServer = new CoordinatorServer(conf);
+            coordinatorServer = new CoordinatorServer(conf, clock);
             coordinatorServer.start();
             coordinatorServerInfo =
                     // TODO, Currently, we use 0 as coordinator server id.
@@ -306,10 +310,17 @@ public final class FlussClusterExtension
 
     private void startTabletServer(int serverId, @Nullable Configuration overwriteConfig)
             throws Exception {
+        String rackName;
+        if (racks.length <= serverId) {
+            rackName = "rack-" + serverId;
+        } else {
+            rackName = racks[serverId];
+        }
+
         String dataDir = getDataDir(serverId);
         Configuration tabletServerConf = new Configuration(clusterConf);
         tabletServerConf.set(ConfigOptions.TABLET_SERVER_ID, serverId);
-        tabletServerConf.set(ConfigOptions.TABLET_SERVER_RACK, "rack" + serverId);
+        tabletServerConf.set(ConfigOptions.TABLET_SERVER_RACK, rackName);
         tabletServerConf.set(ConfigOptions.DATA_DIR, dataDir);
         tabletServerConf.setString(
                 ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
@@ -325,7 +336,7 @@ public final class FlussClusterExtension
         ServerInfo serverInfo =
                 new ServerInfo(
                         serverId,
-                        "rack" + serverId,
+                        rackName,
                         tabletServer.getRpcServer().getBindEndpoints(),
                         ServerType.TABLET_SERVER);
 
@@ -459,6 +470,10 @@ public final class FlussClusterExtension
 
     public ZooKeeperClient getZooKeeperClient() {
         return zooKeeperClient;
+    }
+
+    public RebalanceManager getRebalanceManager() {
+        return coordinatorServer.getRebalanceManager();
     }
 
     public RpcClient getRpcClient() {
@@ -676,7 +691,90 @@ public final class FlussClusterExtension
                 });
     }
 
-    public CompletedSnapshot waitUntilSnapshotFinished(TableBucket tableBucket, long snapshotId) {
+    public void triggerAndWaitSnapshot(TablePath tablePath) throws Exception {
+        Optional<TableRegistration> table = zooKeeperClient.getTable(tablePath);
+        //noinspection SimplifyOptionalCallChains (Java 8 compatibility)
+        if (!table.isPresent()) {
+            throw new IllegalStateException("Table not found for table path " + tablePath);
+        }
+
+        TableRegistration tableRegistration = table.get();
+        long tableId = tableRegistration.tableId;
+        int bucketCount = tableRegistration.bucketCount;
+
+        List<TableBucket> tableBuckets = new ArrayList<>();
+        if (!tableRegistration.isPartitioned()) {
+            for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
+                tableBuckets.add(new TableBucket(tableId, null, bucketId));
+            }
+        } else {
+            Map<String, Long> partitions = zooKeeperClient.getPartitionNameAndIds(tablePath);
+            for (Long partitionId : partitions.values()) {
+                for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
+                    tableBuckets.add(new TableBucket(tableId, partitionId, bucketId));
+                }
+            }
+        }
+
+        // trigger and wait all snapshots finished
+        triggerAndWaitSnapshots(tableBuckets);
+    }
+
+    public void triggerAndWaitSnapshots(Collection<TableBucket> tableBuckets) {
+        Map<TableBucket, Long> snapshotMap = new HashMap<>();
+        for (TableBucket tableBucket : tableBuckets) {
+            Long snapshotId = triggerSnapshot(tableBucket);
+            if (snapshotId != null) {
+                snapshotMap.put(tableBucket, snapshotId);
+            }
+        }
+        // wait all snapshots finished
+        for (Map.Entry<TableBucket, Long> entry : snapshotMap.entrySet()) {
+            waitUntilSnapshotFinished(entry.getKey(), entry.getValue());
+        }
+    }
+
+    public CompletedSnapshot triggerAndWaitSnapshot(TableBucket tableBucket) {
+        Long snapshotId = triggerSnapshot(tableBucket);
+        if (snapshotId != null) {
+            return waitUntilSnapshotFinished(tableBucket, snapshotId);
+        } else {
+            fail("No new snapshot triggered for table bucket " + tableBucket);
+            return null;
+        }
+    }
+
+    private Long triggerSnapshot(TableBucket tableBucket) {
+        Long snapshotId = null;
+        Long nextSnapshotId = null;
+        for (TabletServer ts : tabletServers.values()) {
+            ReplicaManager.HostedReplica replica = ts.getReplicaManager().getReplica(tableBucket);
+            if (replica instanceof ReplicaManager.OnlineReplica) {
+                Replica r = ((ReplicaManager.OnlineReplica) replica).getReplica();
+                PeriodicSnapshotManager kvSnapshotManager = r.getKvSnapshotManager();
+                if (r.isLeader() && kvSnapshotManager != null) {
+                    snapshotId = kvSnapshotManager.currentSnapshotId();
+                    kvSnapshotManager.triggerSnapshot();
+                    nextSnapshotId = kvSnapshotManager.currentSnapshotId();
+                    break;
+                }
+            }
+        }
+
+        if (snapshotId != null) {
+            if (nextSnapshotId > snapshotId) {
+                // only there is a new snapshot triggered, we return the snapshot id
+                return snapshotId;
+            } else {
+                return null;
+            }
+        } else {
+            fail("No KV snapshot manager found for table bucket " + tableBucket);
+            return null;
+        }
+    }
+
+    private CompletedSnapshot waitUntilSnapshotFinished(TableBucket tableBucket, long snapshotId) {
         ZooKeeperClient zkClient = getZooKeeperClient();
         return waitValue(
                 () -> {
@@ -688,7 +786,7 @@ public final class FlussClusterExtension
                                     uncheckedFunction(
                                             CompletedSnapshotHandle::retrieveCompleteSnapshot));
                 },
-                Duration.ofMinutes(2),
+                Duration.ofSeconds(30),
                 String.format(
                         "Fail to wait bucket %s snapshot %d finished", tableBucket, snapshotId));
     }
@@ -727,7 +825,7 @@ public final class FlussClusterExtension
                                 .addAllStopReplicasReqs(
                                         Collections.singleton(
                                                 makeStopBucketReplica(
-                                                        tableBucket, false, leaderEpoch))))
+                                                        tableBucket, false, false, leaderEpoch))))
                 .get();
     }
 
@@ -841,6 +939,7 @@ public final class FlussClusterExtension
         private String tabletServerListeners = DEFAULT_LISTENERS;
         private String coordinatorServerListeners = DEFAULT_LISTENERS;
         private Clock clock = SystemClock.getInstance();
+        private String[] racks = new String[] {"rack-0"};
 
         private final Configuration clusterConf = new Configuration();
 
@@ -880,13 +979,28 @@ public final class FlussClusterExtension
             return this;
         }
 
+        /** Sets the racks of tablet servers. */
+        public Builder setRacks(String[] racks) {
+            this.racks = racks;
+            return this;
+        }
+
         public FlussClusterExtension build() {
+            if (numOfTabletServers > 1 && racks.length == 1) {
+                String[] racks = new String[numOfTabletServers];
+                for (int i = 0; i < numOfTabletServers; i++) {
+                    racks[i] = "rack-" + i;
+                }
+                this.racks = racks;
+            }
+
             return new FlussClusterExtension(
                     numOfTabletServers,
                     coordinatorServerListeners,
                     tabletServerListeners,
                     clusterConf,
-                    clock);
+                    clock,
+                    racks);
         }
     }
 }

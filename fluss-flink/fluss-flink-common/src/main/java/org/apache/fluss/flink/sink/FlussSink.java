@@ -19,6 +19,10 @@ package org.apache.fluss.flink.sink;
 
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
+import org.apache.fluss.metadata.TablePath;
+
+import org.apache.flink.streaming.api.connector.sink2.SupportsPreWriteTopology;
+import org.apache.flink.streaming.api.datastream.DataStream;
 
 /**
  * FlussSink is a specialized Flink sink for writing data to Fluss.
@@ -31,16 +35,25 @@ import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
  * @since 0.7
  */
 @PublicEvolving
-public class FlussSink<InputT> extends FlinkSink<InputT> {
+public class FlussSink<InputT> extends FlinkSink<InputT>
+        implements SupportsPreWriteTopology<InputT> {
     private static final long serialVersionUID = 1L;
 
     /**
      * Constructs a FlussSink with the given SinkWriterBuilder.
      *
      * @param builder the builder used to create the sink writer
+     * @param tablePath the table path
      */
-    FlussSink(SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder) {
-        super(builder);
+    FlussSink(
+            SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder,
+            TablePath tablePath) {
+        super(builder, tablePath);
+    }
+
+    @Override
+    public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
+        return builder.addPreWriteTopology(input);
     }
 
     /**

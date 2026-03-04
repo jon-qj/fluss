@@ -26,6 +26,7 @@ import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
+import org.apache.fluss.client.table.scanner.log.TypedLogScanner;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -112,8 +113,6 @@ public abstract class ClientToServerITCaseBase {
     private static Configuration initConfig() {
         Configuration conf = new Configuration();
         conf.setInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR, 3);
-        // set a shorter interval for testing purpose
-        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1));
         // set default datalake format for the cluster and enable datalake tables
         conf.set(ConfigOptions.DATALAKE_FORMAT, DataLakeFormat.PAIMON);
 
@@ -138,6 +137,13 @@ public abstract class ClientToServerITCaseBase {
     }
 
     protected static void subscribeFromBeginning(LogScanner logScanner, Table table) {
+        int bucketCount = table.getTableInfo().getNumBuckets();
+        for (int i = 0; i < bucketCount; i++) {
+            logScanner.subscribeFromBeginning(i);
+        }
+    }
+
+    protected static void subscribeFromBeginning(TypedLogScanner<?> logScanner, Table table) {
         int bucketCount = table.getTableInfo().getNumBuckets();
         for (int i = 0; i < bucketCount; i++) {
             logScanner.subscribeFromBeginning(i);

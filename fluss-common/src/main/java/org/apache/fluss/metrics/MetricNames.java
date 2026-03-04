@@ -39,6 +39,7 @@ public class MetricNames {
     public static final String ACTIVE_TABLET_SERVER_COUNT = "activeTabletServerCount";
     public static final String OFFLINE_BUCKET_COUNT = "offlineBucketCount";
     public static final String TABLE_COUNT = "tableCount";
+    public static final String LAKE_TABLE_COUNT = "lakeTableCount";
     public static final String BUCKET_COUNT = "bucketCount";
     public static final String PARTITION_COUNT = "partitionCount";
     public static final String REPLICAS_TO_DELETE_COUNT = "replicasToDeleteCount";
@@ -52,6 +53,11 @@ public class MetricNames {
     public static final String KV_NUM_SNAPSHOTS = "numKvSnapshots";
     public static final String KV_ALL_SNAPSHOT_SIZE = "allKvSnapshotSize";
     public static final String SERVER_PHYSICAL_STORAGE_REMOTE_KV_SIZE = "remoteKvSize";
+
+    // for kv snapshot lease.
+    // TODO implemented it at the table level. Trace by: https://github.com/apache/fluss/issues/2297
+    public static final String KV_SNAPSHOT_LEASE_COUNT = "kvSnapshotLeaseCount";
+    public static final String LEASED_KV_SNAPSHOT_COUNT = "leasedKvSnapshotCount";
 
     // --------------------------------------------------------------------------------------------
     // metrics for tablet server
@@ -73,6 +79,12 @@ public class MetricNames {
     public static final String SERVER_LOGICAL_STORAGE_KV_SIZE = "kvSize";
     public static final String SERVER_PHYSICAL_STORAGE_LOCAL_SIZE = "localSize";
     public static final String SERVER_PHYSICAL_STORAGE_REMOTE_LOG_SIZE = "remoteLogSize";
+
+    // --------------------------------------------------------------------------------------------
+    // metrics for user
+    // --------------------------------------------------------------------------------------------
+    public static final String BYTES_IN = "bytesIn";
+    public static final String BYTES_OUT = "bytesOut";
 
     // --------------------------------------------------------------------------------------------
     // metrics for table
@@ -124,6 +136,75 @@ public class MetricNames {
             "preWriteBufferTruncateAsDuplicatedPerSecond";
     public static final String KV_PRE_WRITE_BUFFER_TRUNCATE_AS_ERROR_RATE =
             "preWriteBufferTruncateAsErrorPerSecond";
+
+    // --------------------------------------------------------------------------------------------
+    // RocksDB metrics
+    // --------------------------------------------------------------------------------------------
+    // Table-level RocksDB metrics (aggregated from all buckets of a table, Max aggregation)
+    /** Maximum write stall duration across all buckets of this table (Max aggregation). */
+    public static final String ROCKSDB_WRITE_STALL_MICROS_MAX = "rocksdbWriteStallMicrosMax";
+
+    /** Maximum get latency across all buckets of this table (Max aggregation). */
+    public static final String ROCKSDB_GET_LATENCY_MICROS_MAX = "rocksdbGetLatencyMicrosMax";
+
+    /** Maximum write latency across all buckets of this table (Max aggregation). */
+    public static final String ROCKSDB_WRITE_LATENCY_MICROS_MAX = "rocksdbWriteLatencyMicrosMax";
+
+    /** Maximum number of L0 files across all buckets of this table (Max aggregation). */
+    public static final String ROCKSDB_NUM_FILES_AT_LEVEL0_MAX = "rocksdbNumFilesAtLevel0Max";
+
+    /** Maximum flush pending indicator across all buckets of this table (Max aggregation). */
+    public static final String ROCKSDB_FLUSH_PENDING_MAX = "rocksdbFlushPendingMax";
+
+    /** Maximum compaction pending indicator across all buckets of this table (Max aggregation). */
+    public static final String ROCKSDB_COMPACTION_PENDING_MAX = "rocksdbCompactionPendingMax";
+
+    /** Maximum compaction time across all buckets of this table (Max aggregation). */
+    public static final String ROCKSDB_COMPACTION_TIME_MICROS_MAX =
+            "rocksdbCompactionTimeMicrosMax";
+
+    // Table-level RocksDB metrics (aggregated from all buckets of a table, Sum aggregation)
+    /** Total bytes read across all buckets of this table (Sum aggregation). */
+    public static final String ROCKSDB_BYTES_READ_TOTAL = "rocksdbBytesReadTotal";
+
+    /** Total bytes written across all buckets of this table (Sum aggregation). */
+    public static final String ROCKSDB_BYTES_WRITTEN_TOTAL = "rocksdbBytesWrittenTotal";
+
+    /** Total flush bytes written across all buckets of this table (Sum aggregation). */
+    public static final String ROCKSDB_FLUSH_BYTES_WRITTEN_TOTAL = "rocksdbFlushBytesWrittenTotal";
+
+    /** Total compaction bytes read across all buckets of this table (Sum aggregation). */
+    public static final String ROCKSDB_COMPACTION_BYTES_READ_TOTAL =
+            "rocksdbCompactionBytesReadTotal";
+
+    /** Total compaction bytes written across all buckets of this table (Sum aggregation). */
+    public static final String ROCKSDB_COMPACTION_BYTES_WRITTEN_TOTAL =
+            "rocksdbCompactionBytesWrittenTotal";
+
+    // Server-level RocksDB metrics (aggregated from all tables, Sum aggregation)
+    /** Total memory usage across all RocksDB instances in this server (Sum aggregation). */
+    public static final String ROCKSDB_MEMORY_USAGE_TOTAL = "rocksdbMemoryUsageTotal";
+
+    // Table-level RocksDB memory metrics (Sum aggregation)
+    /** Total memtable memory usage across all buckets of this table. */
+    public static final String ROCKSDB_MEMTABLE_MEMORY_USAGE_TOTAL =
+            "rocksdbMemTableMemoryUsageTotal";
+
+    /** Total unflushed memtable memory usage across all buckets of this table. */
+    public static final String ROCKSDB_MEMTABLE_UNFLUSHED_MEMORY_USAGE_TOTAL =
+            "rocksdbMemTableUnFlushedMemoryUsageTotal";
+
+    /** Total table readers (indexes and filters) memory usage across all buckets of this table. */
+    public static final String ROCKSDB_TABLE_READERS_MEMORY_USAGE_TOTAL =
+            "rocksdbTableReadersMemoryUsageTotal";
+
+    /** Total block cache memory usage across all buckets of this table. */
+    public static final String ROCKSDB_BLOCK_CACHE_MEMORY_USAGE_TOTAL =
+            "rocksdbBlockCacheMemoryUsageTotal";
+
+    /** Total pinned memory in block cache across all buckets of this table. */
+    public static final String ROCKSDB_BLOCK_CACHE_PINNED_USAGE_TOTAL =
+            "rocksdbBlockCachePinnedUsageTotal";
 
     // --------------------------------------------------------------------------------------------
     // metrics for table bucket

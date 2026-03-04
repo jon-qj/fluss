@@ -46,16 +46,19 @@ public class LakeTieringJobBuilder {
     private final StreamExecutionEnvironment env;
     private final Configuration flussConfig;
     private final Configuration dataLakeConfig;
+    private final Configuration lakeTieringConfig;
     private final String dataLakeFormat;
 
     private LakeTieringJobBuilder(
             StreamExecutionEnvironment env,
             Configuration flussConfig,
             Configuration dataLakeConfig,
+            Configuration lakeTieringConfig,
             String dataLakeFormat) {
         this.env = checkNotNull(env);
         this.flussConfig = checkNotNull(flussConfig);
         this.dataLakeConfig = checkNotNull(dataLakeConfig);
+        this.lakeTieringConfig = checkNotNull(lakeTieringConfig);
         this.dataLakeFormat = checkNotNull(dataLakeFormat);
     }
 
@@ -63,8 +66,10 @@ public class LakeTieringJobBuilder {
             StreamExecutionEnvironment env,
             Configuration flussConfig,
             Configuration dataLakeConfig,
+            Configuration lakeTieringConfig,
             String dataLakeFormat) {
-        return new LakeTieringJobBuilder(env, flussConfig, dataLakeConfig, dataLakeFormat);
+        return new LakeTieringJobBuilder(
+                env, flussConfig, dataLakeConfig, lakeTieringConfig, dataLakeFormat);
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -84,6 +89,7 @@ public class LakeTieringJobBuilder {
             tieringSourceBuilder.withPollTieringTableIntervalMs(
                     flussConfig.get(POLL_TIERING_TABLE_INTERVAL).toMillis());
         }
+
         TieringSource<?> tieringSource = tieringSourceBuilder.build();
         DataStreamSource<?> source =
                 env.fromSource(
@@ -99,7 +105,8 @@ public class LakeTieringJobBuilder {
                         "TieringCommitter",
                         CommittableMessageTypeInfo.of(
                                 () -> lakeTieringFactory.getCommittableSerializer()),
-                        new TieringCommitOperatorFactory(flussConfig, lakeTieringFactory))
+                        new TieringCommitOperatorFactory(
+                                flussConfig, lakeTieringConfig, lakeTieringFactory))
                 .setParallelism(1)
                 .setMaxParallelism(1)
                 .sinkTo(new DiscardingSink())
@@ -108,7 +115,7 @@ public class LakeTieringJobBuilder {
         String jobName =
                 env.getConfiguration()
                         .getOptional(PipelineOptions.NAME)
-                        .orElse(DEFAULT_TIERING_SERVICE_JOB_NAME);
+                        .orElse(DEFAULT_TIERING_SERVICE_JOB_NAME + " - " + dataLakeFormat);
 
         return env.executeAsync(jobName);
     }

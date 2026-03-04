@@ -100,7 +100,7 @@ public final class LogTablet {
     private final Scheduler scheduler;
     private final ScheduledFuture<?> writerExpireCheck;
     private final LogFormat logFormat;
-    private final int tieredLogLocalSegments;
+    private volatile int tieredLogLocalSegments;
     private final Clock clock;
     private final boolean isChangeLog;
 
@@ -120,6 +120,8 @@ public final class LogTablet {
     // tracking the log size in remote storage
     private volatile long remoteLogSize = 0;
 
+    // tracking if the data lake enabled
+    private volatile boolean isDataLakeEnabled = false;
     // tracking the log start/end offset in lakehouse storage
     private volatile long lakeTableSnapshotId = -1;
     // note: currently, for primary key table, the log start offset nerve be updated
@@ -231,12 +233,20 @@ public final class LogTablet {
         return localLog.getTableBucket();
     }
 
+    public long getRowCount() {
+        return getHighWatermark() - logStartOffset();
+    }
+
     public long getHighWatermark() {
         return highWatermarkMetadata.getMessageOffset();
     }
 
     public LogOffsetMetadata getLocalEndOffsetMetadata() {
         return localLog.getLocalLogEndOffsetMetadata();
+    }
+
+    public boolean isDataLakeEnabled() {
+        return isDataLakeEnabled;
     }
 
     public long getLakeTableSnapshotId() {
@@ -514,6 +524,18 @@ public final class LogTablet {
             // try to delete the old segments that are not needed.
             deleteSegmentsAlreadyExistsInRemote();
         }
+    }
+
+    public void updateIsDataLakeEnabled(boolean isDataLakeEnabled) {
+        this.isDataLakeEnabled = isDataLakeEnabled;
+    }
+
+    public void updateTieredLogLocalSegments(int tieredLogLocalSegments) {
+        this.tieredLogLocalSegments = tieredLogLocalSegments;
+    }
+
+    public int getTieredLogLocalSegments() {
+        return tieredLogLocalSegments;
     }
 
     public void updateLakeTableSnapshotId(long snapshotId) {
@@ -1277,7 +1299,7 @@ public final class LogTablet {
         Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
         for (LogRecordBatch batch : records.batches()) {
             if (batch.hasWriterId()) {
-                updateWriterAppendInfo(writerStateManager, batch, loadedWriters, true);
+                updateWriterAppendInfo(writerStateManager, batch, loadedWriters, false);
             }
         }
         loadedWriters.values().forEach(writerStateManager::update);

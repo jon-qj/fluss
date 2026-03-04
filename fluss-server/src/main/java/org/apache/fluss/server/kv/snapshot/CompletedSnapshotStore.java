@@ -26,17 +26,24 @@ import org.apache.fluss.metadata.TableBucket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.concurrent.ThreadSafe;
+
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
@@ -47,6 +54,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * managing the completed snapshots including store/subsume/get completed snapshots for single one
  * table bucket.
  */
+@ThreadSafe
 public class CompletedSnapshotStore {
 
     private static final Logger LOG = LoggerFactory.getLogger(CompletedSnapshotStore.class);
@@ -61,6 +69,9 @@ public class CompletedSnapshotStore {
 
     private final Executor ioExecutor;
     private final SnapshotsCleaner snapshotsCleaner;
+    private final SnapshotInUseChecker snapshotInUseChecker;
+
+    private final ReentrantLock lock = new ReentrantLock();
 
     /**
      * Local copy of the completed snapshots in snapshot store. This is restored from snapshot
@@ -68,23 +79,41 @@ public class CompletedSnapshotStore {
      */
     private final ArrayDeque<CompletedSnapshot> completedSnapshots;
 
+    /**
+     * Snapshots that are still in use by a lease but have been moved out of the standard retention
+     * window. These snapshots are protected from deletion (both metadata and SST files) until their
+     * lease expires.
+     *
+     * <p>When a snapshot should be subsumed (beyond the retention window) but cannot be (because
+     * it's leased), it is moved here instead of staying in {@link #completedSnapshots}. This
+     * ensures the effective {@code lowestSnapshotID} is computed from retained snapshots only,
+     * allowing SST files from non-leased subsumed snapshots to be cleaned up properly.
+     */
+    @VisibleForTesting final Map<Long, CompletedSnapshot> stillInUseSnapshots = new HashMap<>();
+
     public CompletedSnapshotStore(
             int maxNumberOfSnapshotsToRetain,
             SharedKvFileRegistry sharedKvFileRegistry,
             Collection<CompletedSnapshot> completedSnapshots,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
-            Executor executor) {
+            Executor executor,
+            SnapshotInUseChecker snapshotInUseChecker) {
         this.maxNumberOfSnapshotsToRetain = maxNumberOfSnapshotsToRetain;
         this.sharedKvFileRegistry = sharedKvFileRegistry;
         this.completedSnapshots = new ArrayDeque<>();
         this.completedSnapshots.addAll(completedSnapshots);
         this.completedSnapshotHandleStore = completedSnapshotHandleStore;
+        this.snapshotInUseChecker = snapshotInUseChecker;
         this.ioExecutor = executor;
         this.snapshotsCleaner = new SnapshotsCleaner();
     }
 
     public void add(final CompletedSnapshot completedSnapshot) throws Exception {
-        addSnapshotAndSubsumeOldestOne(completedSnapshot, snapshotsCleaner, () -> {});
+        inLock(
+                lock,
+                () ->
+                        addSnapshotAndSubsumeOldestOne(
+                                completedSnapshot, snapshotsCleaner, () -> {}));
     }
 
     public long getPhysicalStorageRemoteKvSize() {
@@ -92,7 +121,7 @@ public class CompletedSnapshotStore {
     }
 
     public long getNumSnapshots() {
-        return completedSnapshots.size();
+        return inLock(lock, completedSnapshots::size);
     }
 
     /**
@@ -102,7 +131,7 @@ public class CompletedSnapshotStore {
      * @param snapshot Completed snapshot to add.
      */
     @VisibleForTesting
-    CompletedSnapshot addSnapshotAndSubsumeOldestOne(
+    void addSnapshotAndSubsumeOldestOne(
             final CompletedSnapshot snapshot,
             SnapshotsCleaner snapshotsCleaner,
             Runnable postCleanup)
@@ -117,53 +146,93 @@ public class CompletedSnapshotStore {
                 snapshot.getTableBucket(), snapshot.getSnapshotID(), completedSnapshotHandle);
 
         // Now add the new one. If it fails, we don't want to lose existing data.
-        completedSnapshots.addLast(snapshot);
+        inLock(
+                lock,
+                () -> {
+                    completedSnapshots.addLast(snapshot);
 
-        // Remove completed snapshot from queue and snapshotStateHandleStore, not discard.
-        Optional<CompletedSnapshot> subsume =
-                subsume(
-                        completedSnapshots,
-                        maxNumberOfSnapshotsToRetain,
-                        completedSnapshot -> {
-                            remove(
-                                    completedSnapshot.getTableBucket(),
-                                    completedSnapshot.getSnapshotID());
-                            snapshotsCleaner.addSubsumedSnapshot(completedSnapshot);
-                        });
+                    // Remove completed snapshot from queue and snapshotStateHandleStore, not
+                    // discard.
+                    subsume(
+                            completedSnapshots,
+                            maxNumberOfSnapshotsToRetain,
+                            completedSnapshot -> {
+                                if (snapshotInUseChecker.isInUse(completedSnapshot)) {
+                                    LOG.debug(
+                                            "Snapshot {} is still in use, move it to stillInUseSnapshots",
+                                            completedSnapshot.getSnapshotID());
+                                    stillInUseSnapshots.put(
+                                            completedSnapshot.getSnapshotID(), completedSnapshot);
+                                } else {
+                                    remove(
+                                            completedSnapshot.getTableBucket(),
+                                            completedSnapshot.getSnapshotID());
+                                    snapshotsCleaner.addSubsumedSnapshot(completedSnapshot);
+                                }
+                            });
 
-        findLowest(completedSnapshots)
-                .ifPresent(
-                        id -> {
-                            // unregister the unused kv file, which will then cause the kv file
-                            // deletion
-                            sharedKvFileRegistry.unregisterUnusedKvFile(id);
-                            snapshotsCleaner.cleanSubsumedSnapshots(
-                                    id, Collections.emptySet(), postCleanup, ioExecutor);
-                        });
-        return subsume.orElse(null);
+                    // Check if any previously still-in-use snapshots can now be released
+                    // (lease expired).
+                    removeUnusedSnapshots(snapshotsCleaner);
+
+                    // SST file cleanup: compute effective lowest from retained (non-leased)
+                    // snapshots only, and protect files referenced by still-in-use snapshots.
+                    Set<Long> stillInUseIds = new HashSet<>(stillInUseSnapshots.keySet());
+                    findLowest(completedSnapshots)
+                            .ifPresent(
+                                    id ->
+                                            sharedKvFileRegistry.unregisterUnusedKvFile(
+                                                    id, stillInUseIds));
+
+                    // Snapshot metadata/private files cleanup: use the latest snapshot
+                    // ID + 1 so subsumed snapshots can be cleaned even when a lower
+                    // snapshot has a lease. This is safe because
+                    // KvSnapshotHandle.discard() only deletes private files and
+                    // metadata, not shared SST files registered in SharedKvFileRegistry.
+                    snapshotsCleaner.cleanSubsumedSnapshots(
+                            snapshot.getSnapshotID() + 1, stillInUseIds, postCleanup, ioExecutor);
+                });
     }
 
+    private void removeUnusedSnapshots(SnapshotsCleaner snapshotsCleaner) throws Exception {
+        Iterator<Map.Entry<Long, CompletedSnapshot>> stillInUseIter =
+                stillInUseSnapshots.entrySet().iterator();
+        while (stillInUseIter.hasNext()) {
+            Map.Entry<Long, CompletedSnapshot> entry = stillInUseIter.next();
+            CompletedSnapshot snapshot = entry.getValue();
+            if (!snapshotInUseChecker.isInUse(snapshot)) {
+                stillInUseIter.remove();
+
+                remove(snapshot.getTableBucket(), snapshot.getSnapshotID());
+                snapshotsCleaner.addSubsumedSnapshot(snapshot);
+                LOG.debug(
+                        "Released snapshot {} from stillInUseSnapshots (lease expired)",
+                        snapshot.getSnapshotID());
+            }
+        }
+    }
+
+    /**
+     * Returns a list of all the completed snapshots in this store. Note this doesn't include the
+     * snapshots that are still in use but have been moved out of the standard retention window,
+     * which can be obtained from {@link #stillInUseSnapshots}.
+     */
+    @VisibleForTesting
     public List<CompletedSnapshot> getAllSnapshots() {
-        return new ArrayList<>(completedSnapshots);
+        return inLock(lock, () -> new ArrayList<>(completedSnapshots));
     }
 
-    private static Optional<CompletedSnapshot> subsume(
+    private static void subsume(
             Deque<CompletedSnapshot> snapshots, int numRetain, SubsumeAction subsumeAction) {
         if (snapshots.isEmpty()) {
-            return Optional.empty();
+            return;
         }
 
         CompletedSnapshot latest = snapshots.peekLast();
-        Optional<CompletedSnapshot> lastSubsumedSnapshot = Optional.empty();
         Iterator<CompletedSnapshot> iterator = snapshots.iterator();
         while (snapshots.size() > numRetain && iterator.hasNext()) {
             CompletedSnapshot next = iterator.next();
             if (canSubsume(next, latest)) {
-                // always return the subsumed snapshot with larger snapshot id.
-                if (!lastSubsumedSnapshot.isPresent()
-                        || next.getSnapshotID() > lastSubsumedSnapshot.get().getSnapshotID()) {
-                    lastSubsumedSnapshot = Optional.of(next);
-                }
                 iterator.remove();
                 try {
                     subsumeAction.subsume(next);
@@ -172,12 +241,17 @@ public class CompletedSnapshotStore {
                 }
             }
         }
-        return lastSubsumedSnapshot;
     }
 
     @FunctionalInterface
     interface SubsumeAction {
         void subsume(CompletedSnapshot snapshot) throws Exception;
+    }
+
+    /** A function to check whether a snapshot still in use. */
+    @FunctionalInterface
+    public interface SnapshotInUseChecker {
+        boolean isInUse(CompletedSnapshot snapshot);
     }
 
     private static boolean canSubsume(CompletedSnapshot next, CompletedSnapshot latest) {
@@ -211,7 +285,7 @@ public class CompletedSnapshotStore {
      * added.
      */
     public Optional<CompletedSnapshot> getLatestSnapshot() {
-        return Optional.ofNullable(completedSnapshots.peekLast());
+        return inLock(lock, () -> Optional.ofNullable(completedSnapshots.peekLast()));
     }
 
     /**

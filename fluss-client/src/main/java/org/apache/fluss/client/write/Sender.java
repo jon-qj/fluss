@@ -30,7 +30,6 @@ import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbProduceLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
@@ -56,6 +55,7 @@ import java.util.Set;
 
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeProduceLogRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makePutKvRequest;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /* This file is based on source code of Apache Kafka Project (https://kafka.apache.org/), licensed by the Apache
@@ -263,6 +263,17 @@ public class Sender implements Runnable {
         }
     }
 
+    /** Complete batch with bucket and log end offset info (for KV batches). */
+    private void completeBatch(
+            ReadyWriteBatch readyWriteBatch, TableBucket bucket, long logEndOffset) {
+        if (idempotenceManager.idempotenceEnabled()) {
+            idempotenceManager.handleCompletedBatch(readyWriteBatch);
+        }
+        if (readyWriteBatch.writeBatch().complete(bucket, logEndOffset)) {
+            maybeRemoveAndDeallocateBatch(readyWriteBatch);
+        }
+    }
+
     private void failBatch(
             ReadyWriteBatch batch, Exception exception, boolean adjustBatchSequences) {
         if (batch.writeBatch().completeExceptionally(exception)) {
@@ -377,24 +388,36 @@ public class Sender implements Runnable {
         } else {
             writeBatchByTable.forEach(
                     (tableId, writeBatches) -> {
-                        TableInfo tableInfo = metadataUpdater.getTableInfoOrElseThrow(tableId);
-                        if (tableInfo.hasPrimaryKey()) {
-                            sendPutKvRequestAndHandleResponse(
-                                    gateway,
-                                    makePutKvRequest(
-                                            tableId, acks, maxRequestTimeoutMs, writeBatches),
-                                    tableId,
-                                    recordsByBucket);
-                        } else {
+                        if (isLogBatches(writeBatches)) {
                             sendProduceLogRequestAndHandleResponse(
                                     gateway,
                                     makeProduceLogRequest(
                                             tableId, acks, maxRequestTimeoutMs, writeBatches),
                                     tableId,
                                     recordsByBucket);
+                        } else {
+                            sendPutKvRequestAndHandleResponse(
+                                    gateway,
+                                    makePutKvRequest(
+                                            tableId, acks, maxRequestTimeoutMs, writeBatches),
+                                    tableId,
+                                    recordsByBucket);
                         }
                     });
         }
+    }
+
+    /**
+     * Check whether the given batches are log batches. We assume all the batches are of the same
+     * type.
+     *
+     * @param batches the batches to check, must not be empty.
+     * @return true if the given batches are log batches, false if they are kv batches.
+     */
+    private boolean isLogBatches(List<ReadyWriteBatch> batches) {
+        checkArgument(!batches.isEmpty(), "batches must not be empty");
+        ReadyWriteBatch batch = batches.get(0);
+        return batch.writeBatch().isLogBatch();
     }
 
     private void sendProduceLogRequestAndHandleResponse(
@@ -480,7 +503,10 @@ public class Sender implements Runnable {
                                 writeBatch, ApiError.fromErrorMessage(respForBucket));
                 invalidMetadataTablesSet.addAll(invalidMetadataTables);
             } else {
-                completeBatch(writeBatch);
+                // Get log end offset (LEO) from response for KV batches
+                long logEndOffset =
+                        respForBucket.hasLogEndOffset() ? respForBucket.getLogEndOffset() : -1;
+                completeBatch(writeBatch, tb, logEndOffset);
             }
         }
         metadataUpdater.invalidPhysicalTableBucketMeta(invalidMetadataTablesSet);

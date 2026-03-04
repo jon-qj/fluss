@@ -17,14 +17,21 @@
 
 package org.apache.fluss.flink.utils;
 
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.FlinkConnectorOptions.ScanStartupMode;
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
+import org.apache.fluss.metadata.MergeEngineType;
 
+import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.types.logical.RowType;
 
+import javax.annotation.Nullable;
+
+import java.io.File;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -34,6 +41,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static org.apache.flink.configuration.CoreOptions.TMP_DIRS;
+import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
 import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_STARTUP_MODE;
 import static org.apache.fluss.flink.FlinkConnectorOptions.SCAN_STARTUP_TIMESTAMP;
 import static org.apache.fluss.flink.FlinkConnectorOptions.ScanStartupMode.TIMESTAMP;
@@ -52,6 +61,36 @@ public class FlinkConnectorOptionsUtils {
 
     public static void validateTableSourceOptions(ReadableConfig tableOptions) {
         validateScanStartupMode(tableOptions);
+    }
+
+    /**
+     * Validates that the distribution mode is compatible with merge engine tables.
+     *
+     * <p>For primary key tables with any merge engine, keyed shuffle must be enabled to ensure
+     * correct data routing. This is required because:
+     *
+     * <ul>
+     *   <li>AGGREGATION: aggregate state cannot be correctly redistributed on rescale
+     *   <li>FIRST_ROW/VERSIONED: merge semantics require same-key records go to same task
+     * </ul>
+     *
+     * @param mergeEngineType the merge engine type (can be null for non-merge-engine tables)
+     * @param distributionMode the distribution mode configured for the sink
+     * @throws IllegalArgumentException if distribution mode is incompatible with merge engine
+     */
+    public static void validateDistributionModeForMergeEngine(
+            @Nullable MergeEngineType mergeEngineType, DistributionMode distributionMode) {
+        if (mergeEngineType != null
+                && distributionMode != DistributionMode.BUCKET
+                && distributionMode != DistributionMode.AUTO) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "For primary key tables with merge engine ('%s'), "
+                                    + "'sink.distribution-mode' must be 'bucket' or 'auto' (default). "
+                                    + "Disabling shuffle breaks merge semantics because records with the same key "
+                                    + "must be processed by the same task. Current mode: %s",
+                            mergeEngineType, distributionMode));
+        }
     }
 
     public static StartupOptions getStartupOptions(ReadableConfig tableOptions, ZoneId timeZone) {
@@ -146,6 +185,17 @@ public class FlinkConnectorOptionsUtils {
                             optionKey, timestampStr),
                     e);
         }
+    }
+
+    public static String getClientScannerIoTmpDir(
+            Configuration flussConf, org.apache.flink.configuration.Configuration flinkConfig) {
+        if (!flussConf.contains(CLIENT_SCANNER_IO_TMP_DIR)) {
+            if (flinkConfig.contains(TMP_DIRS)) {
+                // pass flink io tmp dir to fluss client.
+                return new File(flinkConfig.get(CoreOptions.TMP_DIRS), "/fluss").getAbsolutePath();
+            }
+        }
+        return flussConf.getString(CLIENT_SCANNER_IO_TMP_DIR);
     }
 
     /** Fluss startup options. * */

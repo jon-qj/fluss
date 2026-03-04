@@ -1,10 +1,10 @@
 ---
 sidebar_label: Delta Joins
 title: Flink Delta Joins
-sidebar_position: 6
+sidebar_position: 7
 ---
 
-# The Delta Join
+# Flink Delta Join
 Beginning with **Apache Flink 2.1**, a new operator called [Delta Join](https://cwiki.apache.org/confluence/display/FLINK/FLIP-486%3A+Introduce+A+New+DeltaJoin) was introduced.
 Compared to traditional streaming joins, the delta join operator significantly reduces the amount of state that needs to be maintained during execution. This improvement helps mitigate several common issues associated with large state sizes, including:
 
@@ -130,7 +130,7 @@ For example:
 - Full primary key: `(city_id, order_id)`
 - Bucket key: `city_id`
 
-This yields an **index** on the prefix key `city_id`, so that you can perform [Prefix Key Lookup](/docs/engine-flink/lookups/#prefix-lookup) by the `city_id`.
+This yields an **index** on the prefix key `city_id`, so that you can perform [Prefix Key Lookup](/engine-flink/lookups.md#prefix-lookup) by the `city_id`.
 
 In this setup:
 * The delta join operator uses the prefix key (`city_id`) to retrieve only relevant right-side records matching each left-side event. 
@@ -144,6 +144,9 @@ The delta join feature is introduced since Flink 2.1 and still evolving, and its
 
 Refer to the [Delta Join Issue](https://issues.apache.org/jira/browse/FLINK-37836) for the most up-to-date information.
 
+:::warning
+There is a known issue ([FLINK-38399](https://issues.apache.org/jira/browse/FLINK-38399)) in Flink ≤ 2.1.1 that prevents certain queries from being translated into delta joins. This has been fixed in Flink 2.1.2 and Flink 2.2.
+:::
 
 ### Flink 2.1
 
@@ -155,28 +158,36 @@ Refer to the [Delta Join Issue](https://issues.apache.org/jira/browse/FLINK-3783
 
 - The primary key or the prefix key of the tables must be included as part of the equivalence conditions in the join.
 - The join must be a INNER join.
-- The downstream nodes of the join can accept duplicate changes, such as a sink that provides UPSERT mode without `upsertMaterialize`.
+- The downstream node of the join must support idempotent updates, typically it's an upsert sink and should not have a `SinkUpsertMaterializer` node before it.
+  - Flink planner automatically inserts a `SinkUpsertMaterializer` when the sink’s primary key does not fully cover the upstream update key.
+  - You can learn more details about `SinkUpsertMaterializer` by reading this [blog](https://www.ververica.com/blog/flink-sql-secrets-mastering-the-art-of-changelog-events).
 - All join inputs should be INSERT-ONLY streams.
   - This is why the option `'table.merge-engine' = 'first_row'` is added to the source table DDL.
 - All upstream nodes of the join should be `TableSourceScan` or `Exchange`.
 
-### Flink 2.2 (upcoming)
+### Flink 2.2
 
 #### Supported Features
 
-- Support for optimizing a dual-stream join from CDC sources that do not include delete messages into a delta join.
-  - Disable delete on the source table to guarantee there is no delete message in the table, by adding the option `'table.delete.behavior' = 'IGNORE'` or `'DISABLE'` on the table.
-  - The source table is no more required to be a `first_row` merge engine table since this version.
-- Support `Project` and `Filter` between source and delta join.
-- Support cache in delta join.
+- CDC sources are now supported in delta join, provided they do not produce DELETE messages.
+  - Set `'table.delete.behavior' = 'IGNORE'` or `'DISABLE'` on the source table to suppress deletes.
+  - The `'table.merge-engine' = 'first_row'` option is no longer required.
+- Projection and filter operations are now supported between source and delta join.
+- Lookup cache is now supported in delta join.
 
 #### Limitations
 
-- The primary key or the prefix lookup key of the tables must be included as part of the equivalence conditions in the join.
-- The join must be a INNER join.
-- The downstream nodes of the join can accept duplicate changes, such as a sink that provides UPSERT mode.
-- When consuming a CDC stream, the join key used in the delta join must be part of the primary key.
-- All filters must be applied on the upsert key, and neither filters nor projections should contain non-deterministic functions.
+- The primary key or the prefix key of the tables must be included as part of the equivalence conditions in the join.
+- The join must be an INNER join. LEFT JOIN, RIGHT JOIN, and FULL OUTER JOIN are not supported.
+- Cascade joins (e.g., `A JOIN B JOIN C`) are not supported. Each join input must come directly from a table source.
+- The downstream node of the join must support idempotent updates, typically it's an upsert sink and should not have a `SinkUpsertMaterializer` node before it.
+  - Flink planner automatically inserts a `SinkUpsertMaterializer` when the sink's primary key does not fully cover the upstream update key.
+  - You can learn more details about `SinkUpsertMaterializer` by reading this [blog](https://www.ververica.com/blog/flink-sql-secrets-mastering-the-art-of-changelog-events).
+- Since delta join does not support to handle update-before messages, it is necessary to ensure that the entire pipeline can safely discard update-before messages. That means when consuming a CDC stream:
+  - The join key used in the delta join must be part of the primary key.
+  - The sink's primary key must be the same as the upstream update key.
+  - All filters (including non-equi join conditions) must be applied on the upsert key.
+- Filters, projections, and non-equi join conditions must not contain non-deterministic functions.
 
 ## Future Plan
 

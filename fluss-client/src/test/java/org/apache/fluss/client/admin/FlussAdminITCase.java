@@ -22,8 +22,10 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.metadata.KvSnapshotMetadata;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.cluster.ServerNode;
+import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -39,17 +41,23 @@ import org.apache.fluss.exception.InvalidDatabaseException;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidReplicationFactorException;
 import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.PartitionAlreadyExistsException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.SchemaNotExistException;
+import org.apache.fluss.exception.ServerNotExistException;
+import org.apache.fluss.exception.ServerTagAlreadyExistException;
+import org.apache.fluss.exception.ServerTagNotExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.exception.TooManyPartitionsException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.FsPathAndFileName;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
@@ -64,6 +72,11 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.replica.Replica;
+import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.ServerTags;
+import org.apache.fluss.types.DataTypeChecks;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -80,11 +93,13 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
@@ -129,7 +144,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
     void testMultiClient() throws Exception {
         Admin admin1 = conn.getAdmin();
         Admin admin2 = conn.getAdmin();
-        assertThat(admin1).isNotSameAs(admin2);
+        assertThat(admin1).isEqualTo(admin2);
 
         TableInfo t1 = admin1.getTableInfo(DEFAULT_TABLE_PATH).get();
         TableInfo t2 = admin2.getTableInfo(DEFAULT_TABLE_PATH).get();
@@ -174,11 +189,14 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         long timestampAfterCreate = System.currentTimeMillis();
         TableInfo tableInfo = admin.getTableInfo(DEFAULT_TABLE_PATH).get();
         assertThat(tableInfo.getSchemaId()).isEqualTo(schemaInfo.getSchemaId());
+        TableDescriptor tableDescriptor =
+                DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
+        Map<String, String> options = new HashMap<>(tableDescriptor.getProperties());
+        options.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                String.valueOf(CURRENT_KV_FORMAT_VERSION));
         assertThat(tableInfo.toTableDescriptor())
-                .isEqualTo(
-                        DEFAULT_TABLE_DESCRIPTOR
-                                .withReplicationFactor(3)
-                                .withDataLakeFormat(PAIMON));
+                .isEqualTo(tableDescriptor.withProperties(options));
         assertThat(schemaInfo2).isEqualTo(schemaInfo);
         assertThat(tableInfo.getCreatedTime()).isEqualTo(tableInfo.getModifiedTime());
         assertThat(tableInfo.getCreatedTime()).isLessThan(timestampAfterCreate);
@@ -199,11 +217,14 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         tableInfo = admin.getTableInfo(tablePath).get();
         timestampAfterCreate = System.currentTimeMillis();
         assertThat(tableInfo.getSchemaId()).isEqualTo(schemaInfo.getSchemaId());
-        assertThat(tableInfo.toTableDescriptor())
-                .isEqualTo(
-                        DEFAULT_TABLE_DESCRIPTOR
-                                .withReplicationFactor(3)
-                                .withDataLakeFormat(PAIMON));
+
+        TableDescriptor expected =
+                DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
+        options = new HashMap<>(expected.getProperties());
+        options.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected.withProperties(options));
         assertThat(schemaInfo2).isEqualTo(schemaInfo);
         // assert created time
         assertThat(tableInfo.getCreatedTime())
@@ -228,7 +249,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testAlterTable() throws Exception {
+    void testAlterTableConfig() throws Exception {
         // create table
         TablePath tablePath = TablePath.of("test_db", "alter_table_1");
         admin.createTable(tablePath, DEFAULT_TABLE_DESCRIPTOR, false).get();
@@ -300,6 +321,149 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                         tableChanges,
                         true)
                 .get();
+    }
+
+    @Test
+    void testAlterTableColumn() throws Exception {
+        // create table
+        TablePath tablePath = TablePath.of("test_db", "alter_table_1");
+        admin.createTable(tablePath, DEFAULT_TABLE_DESCRIPTOR, false).get();
+
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.dropColumn("id")),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Not support drop column now.");
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.renameColumn("id", "id2")),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Not support rename column now.");
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.modifyColumn(
+                                                                "id",
+                                                                DataTypes.INT(),
+                                                                "person id",
+                                                                null)),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Not support modify column now.");
+
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.addColumn(
+                                                                "c1",
+                                                                DataTypes.STRING().copy(false),
+                                                                null,
+                                                                TableChange.ColumnPosition.last())),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Column c1 must be nullable");
+
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.addColumn(
+                                                                "c1",
+                                                                DataTypes.STRING().copy(false),
+                                                                null,
+                                                                TableChange.ColumnPosition
+                                                                        .first())),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Unsupported ColumnPositionType: FIRST");
+
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.addColumn(
+                                                                "c1",
+                                                                DataTypes.STRING().copy(false),
+                                                                null,
+                                                                TableChange.ColumnPosition.after(
+                                                                        "name"))),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Unsupported ColumnPositionType: AFTER(name)");
+
+        admin.alterTable(
+                        tablePath,
+                        Arrays.asList(
+                                TableChange.addColumn(
+                                        "nested_row",
+                                        DataTypes.ROW(DataTypes.STRING(), DataTypes.INT()),
+                                        "new nested column",
+                                        TableChange.ColumnPosition.last()),
+                                TableChange.addColumn(
+                                        "c1",
+                                        DataTypes.STRING(),
+                                        "new column c1",
+                                        TableChange.ColumnPosition.last())),
+                        false)
+                .get();
+
+        Schema expectedSchema =
+                Schema.newBuilder()
+                        .primaryKey("id")
+                        .fromColumns(
+                                Arrays.asList(
+                                        new Schema.Column("id", DataTypes.INT(), "person id", 0),
+                                        new Schema.Column(
+                                                "name", DataTypes.STRING(), "person name", 1),
+                                        new Schema.Column("age", DataTypes.INT(), "person age", 2),
+                                        new Schema.Column(
+                                                "nested_row",
+                                                DataTypes.ROW(
+                                                        DataTypes.FIELD(
+                                                                "f0", DataTypes.STRING(), 4),
+                                                        DataTypes.FIELD("f1", DataTypes.INT(), 5)),
+                                                "new nested column",
+                                                3),
+                                        new Schema.Column(
+                                                "c1", DataTypes.STRING(), "new column c1", 6)))
+                        .build();
+        SchemaInfo schemaInfo = admin.getTableSchema(tablePath).get();
+        assertThat(schemaInfo).isEqualTo(new SchemaInfo(expectedSchema, 2));
+        // test field_id of rowType
+        assertThat(
+                        DataTypeChecks.equalsWithFieldId(
+                                schemaInfo.getSchema().getRowType(), expectedSchema.getRowType()))
+                .isTrue();
+
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.addColumn(
+                                                                "nested_row",
+                                                                DataTypes.ROW(
+                                                                        DataTypes.STRING(),
+                                                                        DataTypes.INT()),
+                                                                "new nested column",
+                                                                TableChange.ColumnPosition.last())),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Column nested_row already exists");
     }
 
     @Test
@@ -387,6 +551,47 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         // Get the table and verify delete behavior is changed to IGNORE
         TableInfo tableInfo2 = admin.getTableInfo(tablePath2).join();
         assertThat(tableInfo2.getTableConfig().getDeleteBehavior()).hasValue(DeleteBehavior.IGNORE);
+
+        // Test 2.5: AGGREGATION merge engine - should set delete behavior to IGNORE
+        TablePath tablePathAggregate = TablePath.of("fluss", "test_ignore_delete_for_aggregate");
+        Schema aggregateSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .primaryKey("id")
+                        .build();
+        Map<String, String> propertiesAggregate = new HashMap<>();
+        propertiesAggregate.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "aggregation");
+        TableDescriptor tableDescriptorAggregate =
+                TableDescriptor.builder()
+                        .schema(aggregateSchema)
+                        .comment("aggregate merge engine table")
+                        .properties(propertiesAggregate)
+                        .build();
+        admin.createTable(tablePathAggregate, tableDescriptorAggregate, false).join();
+        // Get the table and verify delete behavior is changed to IGNORE
+        TableInfo tableInfoAggregate = admin.getTableInfo(tablePathAggregate).join();
+        assertThat(tableInfoAggregate.getTableConfig().getDeleteBehavior())
+                .hasValue(DeleteBehavior.IGNORE);
+
+        // Test 2.6: AGGREGATION merge engine with delete behavior explicitly set to ALLOW - should
+        // be allowed
+        TablePath tablePathAggregateAllow =
+                TablePath.of("fluss", "test_allow_delete_for_aggregate");
+        Map<String, String> propertiesAggregateAllow = new HashMap<>();
+        propertiesAggregateAllow.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "aggregation");
+        propertiesAggregateAllow.put(ConfigOptions.TABLE_DELETE_BEHAVIOR.key(), "ALLOW");
+        TableDescriptor tableDescriptorAggregateAllow =
+                TableDescriptor.builder()
+                        .schema(aggregateSchema)
+                        .comment("aggregate merge engine table with allow delete")
+                        .properties(propertiesAggregateAllow)
+                        .build();
+        admin.createTable(tablePathAggregateAllow, tableDescriptorAggregateAllow, false).join();
+        // Get the table and verify delete behavior is set to ALLOW
+        TableInfo tableInfoAggregateAllow = admin.getTableInfo(tablePathAggregateAllow).join();
+        assertThat(tableInfoAggregateAllow.getTableConfig().getDeleteBehavior())
+                .hasValue(DeleteBehavior.ALLOW);
 
         // Test 3: FIRST_ROW merge engine with delete behavior explicitly set to ALLOW
         TablePath tablePath3 = TablePath.of("fluss", "test_allow_delete_for_first_row");
@@ -542,7 +747,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 .cause()
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessageContaining(
-                        "Currently, Primary Key Table only supports ARROW log format if kv format is COMPACTED.");
+                        "Currently, Primary Key Table supports ARROW or COMPACTED log format when kv format is COMPACTED.");
     }
 
     @Test
@@ -597,11 +802,13 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         try (Connection conn = ConnectionFactory.createConnection(clientConf);
                 Admin admin = conn.getAdmin()) {
             TableInfo tableInfo = admin.getTableInfo(DEFAULT_TABLE_PATH).get();
-            assertThat(tableInfo.toTableDescriptor())
-                    .isEqualTo(
-                            DEFAULT_TABLE_DESCRIPTOR
-                                    .withReplicationFactor(3)
-                                    .withDataLakeFormat(PAIMON));
+            TableDescriptor expected =
+                    DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
+            Map<String, String> options = new HashMap<>(expected.getProperties());
+            options.put(
+                    ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                    String.valueOf(CURRENT_KV_FORMAT_VERSION));
+            assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected.withProperties(options));
         }
     }
 
@@ -672,11 +879,27 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         admin.createDatabase("db3", DatabaseDescriptor.EMPTY, true).get();
         assertThat(admin.listDatabases().get())
                 .containsExactlyInAnyOrder("test_db", "db1", "db2", "db3", "fluss");
+        Map<String, Integer> databaseSummaries =
+                admin.listDatabaseSummaries().get().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        DatabaseSummary::getDatabaseName,
+                                        DatabaseSummary::getTableCount));
+        assertThat(databaseSummaries.get("db1")).isEqualTo(0);
+        assertThat(databaseSummaries.get("db2")).isEqualTo(0);
 
         admin.createTable(TablePath.of("db1", "table1"), DEFAULT_TABLE_DESCRIPTOR, true).get();
         admin.createTable(TablePath.of("db1", "table2"), DEFAULT_TABLE_DESCRIPTOR, true).get();
         assertThat(admin.listTables("db1").get()).containsExactlyInAnyOrder("table1", "table2");
         assertThat(admin.listTables("db2").get()).isEmpty();
+        databaseSummaries =
+                admin.listDatabaseSummaries().get().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        DatabaseSummary::getDatabaseName,
+                                        DatabaseSummary::getTableCount));
+        assertThat(databaseSummaries.get("db1")).isEqualTo(1);
+        assertThat(databaseSummaries.get("db2")).isEqualTo(0);
 
         assertThatThrownBy(() -> admin.listTables("unknown_db").get())
                 .cause()
@@ -824,8 +1047,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
             Map<Integer, CompletedSnapshot> expectedSnapshots = new HashMap<>();
             for (int bucket = 0; bucket < bucketNum; bucket++) {
                 CompletedSnapshot completedSnapshot =
-                        FLUSS_CLUSTER_EXTENSION.waitUntilSnapshotFinished(
-                                new TableBucket(tableId, bucket), 0);
+                        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(
+                                new TableBucket(tableId, bucket));
                 expectedSnapshots.put(bucket, completedSnapshot);
             }
 
@@ -841,7 +1064,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
             TableBucket tb = new TableBucket(snapshots.getTableId(), 0);
             // wait until the snapshot finish
             expectedSnapshots.put(
-                    tb.getBucket(), FLUSS_CLUSTER_EXTENSION.waitUntilSnapshotFinished(tb, 1));
+                    tb.getBucket(), FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb));
 
             // check snapshot
             snapshots = admin.getLatestKvSnapshots(tablePath1).get();
@@ -1318,5 +1541,516 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                                 + "because they are reserved system columns in Fluss. "
                                 + "Please use other names for these columns. "
                                 + "The reserved system columns are: __offset, __timestamp, __bucket");
+
+        // Test changelog virtual table metadata columns are also reserved
+        TableDescriptor changelogColumnsDescriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("f0", DataTypes.STRING())
+                                        .column("_change_type", DataTypes.STRING())
+                                        .column("_log_offset", DataTypes.BIGINT())
+                                        .column("_commit_timestamp", DataTypes.TIMESTAMP())
+                                        .build())
+                        .distributedBy(1)
+                        .build();
+
+        TablePath changelogTablePath = TablePath.of(dbName, "test_changelog_columns");
+
+        assertThatThrownBy(
+                        () ->
+                                admin.createTable(
+                                                changelogTablePath,
+                                                changelogColumnsDescriptor,
+                                                false)
+                                        .get())
+                .cause()
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining(
+                        "_change_type, _log_offset, _commit_timestamp cannot be used as column names");
+    }
+
+    @Test
+    public void testAddAndRemoveServerTags() throws Exception {
+        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        // 1.add server tag to a none exists server.
+        assertThatThrownBy(
+                        () ->
+                                admin.addServerTag(
+                                                Collections.singletonList(100),
+                                                ServerTag.PERMANENT_OFFLINE)
+                                        .get())
+                .cause()
+                .isInstanceOf(ServerNotExistException.class)
+                .hasMessageContaining("Server 100 not exists when trying to add server tag.");
+
+        // 2.add server tag for server 0,1.
+        admin.addServerTag(Arrays.asList(0, 1), ServerTag.PERMANENT_OFFLINE).get();
+        assertThat(zkClient.getServerTags()).isPresent();
+        assertThat(zkClient.getServerTags().get().getServerTags())
+                .containsEntry(0, ServerTag.PERMANENT_OFFLINE)
+                .containsEntry(1, ServerTag.PERMANENT_OFFLINE);
+
+        // 3.add different server tag for server 0,2. error will be thrown and tag for 2 will not be
+        // added.
+        assertThatThrownBy(
+                        () ->
+                                admin.addServerTag(Arrays.asList(0, 2), ServerTag.TEMPORARY_OFFLINE)
+                                        .get())
+                .cause()
+                .isInstanceOf(ServerTagAlreadyExistException.class)
+                .hasMessageContaining(
+                        "Server tag PERMANENT_OFFLINE already exists for server 0. However "
+                                + "you want to set it to TEMPORARY_OFFLINE, please remove the server tag first.");
+        Optional<ServerTags> serverTagsOpt = zkClient.getServerTags();
+        assertThat(serverTagsOpt).isPresent();
+        Map<Integer, ServerTag> serverTags = serverTagsOpt.get().getServerTags();
+        assertThat(serverTags.size()).isEqualTo(2);
+        assertThat(serverTags)
+                .containsEntry(0, ServerTag.PERMANENT_OFFLINE)
+                .containsEntry(1, ServerTag.PERMANENT_OFFLINE);
+
+        // 4.remove server tag for server 100
+        assertThatThrownBy(
+                        () ->
+                                admin.removeServerTag(
+                                                Collections.singletonList(100),
+                                                ServerTag.PERMANENT_OFFLINE)
+                                        .get())
+                .cause()
+                .isInstanceOf(ServerNotExistException.class)
+                .hasMessageContaining("Server 100 not exists when trying to removing server tag.");
+
+        // 5.remove server tag for server 0,1.
+        admin.removeServerTag(Arrays.asList(0, 1), ServerTag.PERMANENT_OFFLINE).get();
+        assertThat(zkClient.getServerTags()).isNotPresent();
+
+        // 6.remove server tag for server 2. error will be thrown and tag for 2 will not be removed
+        // as the removed server tag is not equals with the exists one.
+        admin.addServerTag(Collections.singletonList(2), ServerTag.TEMPORARY_OFFLINE).get();
+        assertThatThrownBy(
+                        () ->
+                                admin.removeServerTag(
+                                                Collections.singletonList(2),
+                                                ServerTag.PERMANENT_OFFLINE)
+                                        .get())
+                .cause()
+                .isInstanceOf(ServerTagNotExistException.class)
+                .hasMessageContaining(
+                        "Server tag PERMANENT_OFFLINE not exists for server 2, the current "
+                                + "server tag of this server is TEMPORARY_OFFLINE.");
+    }
+
+    @Test
+    void testAlterTableTieredLogLocalSegments() throws Exception {
+        // 1. Create table with default config = 2
+        TablePath tablePath = TablePath.of("test_db", "test_alter_tiered_segments");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("test table for tiered log segments")
+                        .distributedBy(3)
+                        .build();
+
+        admin.createTable(tablePath, tableDescriptor, false).get();
+
+        // 2. Verify initial config (metadata level)
+        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+        assertThat(tableInfo.getTableConfig().getTieredLogLocalSegments()).isEqualTo(2);
+
+        // 3. Get LogTablet from TabletServer and verify initial state
+        long tableId = tableInfo.getTableId();
+        TableBucket tableBucket = new TableBucket(tableId, 0); // Get first bucket
+
+        // Wait and get leader replica
+        Replica replica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket);
+        LogTablet logTablet = replica.getLogTablet();
+
+        // Verify initial LogTablet internal state
+        assertThat(logTablet.getTieredLogLocalSegments()).isEqualTo(2);
+
+        // 4. Modify to 5 via Admin API
+        List<TableChange> tableChanges = new ArrayList<>();
+        tableChanges.add(TableChange.set(ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key(), "5"));
+        admin.alterTable(tablePath, tableChanges, false).get();
+
+        // 5. Verify metadata has been updated
+        tableInfo = admin.getTableInfo(tablePath).get();
+        assertThat(tableInfo.getTableConfig().getTieredLogLocalSegments()).isEqualTo(5);
+
+        // 6. Wait for config to propagate to TabletServer (via UpdateMetadataRequest)
+        // Use retry mechanism to ensure config has propagated
+        waitUntil(
+                () -> logTablet.getTieredLogLocalSegments() == 5,
+                Duration.ofSeconds(30),
+                "Waiting for config to propagate to TabletServer");
+
+        // 7. Verify LogTablet internal state has been updated
+        assertThat(logTablet.getTieredLogLocalSegments()).isEqualTo(5);
+
+        // 8. Reset to default value
+        tableChanges.clear();
+        tableChanges.add(TableChange.reset(ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key()));
+        admin.alterTable(tablePath, tableChanges, false).get();
+
+        // 9. Verify metadata reset success (config should be removed, using default value 2)
+        tableInfo = admin.getTableInfo(tablePath).get();
+        TableDescriptor td = tableInfo.toTableDescriptor();
+        assertThat(
+                        td.getProperties()
+                                .containsKey(ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key()))
+                .isFalse();
+
+        // 10. Wait for config reset to propagate, verify LogTablet uses default value 2
+        waitUntil(
+                () -> logTablet.getTieredLogLocalSegments() == 2,
+                Duration.ofSeconds(30),
+                "Waiting for config reset to propagate to TabletServer");
+
+        assertThat(logTablet.getTieredLogLocalSegments()).isEqualTo(2);
+
+        // 11. Cleanup
+        admin.dropTable(tablePath, false).get();
+    }
+
+    @Test
+    public void testCreateTableWithInvalidAggFunctionDataType() throws Exception {
+        TablePath tablePath =
+                TablePath.of(
+                        DEFAULT_TABLE_PATH.getDatabaseName(),
+                        "test_invalid_data_type_for_aggfunction");
+        Map<String, String> propertiesAggregate = new HashMap<>();
+        propertiesAggregate.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "aggregation");
+
+        Schema schema1 =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("sum_value", DataTypes.STRING(), AggFunctions.SUM())
+                        .primaryKey("id")
+                        .build();
+        TableDescriptor t1 =
+                TableDescriptor.builder()
+                        .schema(schema1)
+                        .comment("aggregate merge engine table")
+                        .properties(propertiesAggregate)
+                        .build();
+        assertThatThrownBy(() -> admin.createTable(tablePath, t1, false).get())
+                .cause()
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("Data type for sum column must be");
+    }
+
+    /**
+     * Test that aggregate merge engine tables cannot use WAL changelog image mode.
+     *
+     * <p>Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 2.1, 2.2
+     */
+    @Test
+    void testCreateTableWithAggregateEngineAndWalChangelog() throws Exception {
+        // Schema for aggregate merge engine tables
+        Schema aggregateSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("count", DataTypes.BIGINT(), AggFunctions.SUM())
+                        .primaryKey("id")
+                        .build();
+
+        // Test 1: Aggregate + WAL should be rejected
+        TablePath tablePath1 = TablePath.of("fluss", "test_aggregate_wal_changelog_rejected");
+        Map<String, String> properties1 = new HashMap<>();
+        properties1.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "aggregation");
+        properties1.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
+        TableDescriptor tableDescriptor1 =
+                TableDescriptor.builder()
+                        .schema(aggregateSchema)
+                        .comment("aggregate merge engine table with WAL changelog")
+                        .properties(properties1)
+                        .build();
+        assertThatThrownBy(() -> admin.createTable(tablePath1, tableDescriptor1, false).get())
+                .cause()
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(
+                        "Table with 'AGGREGATION' merge engine does not support 'WAL' changelog image mode. "
+                                + "Aggregation merge engine tables require FULL changelog image mode for correct UNDO recovery. "
+                                + "Please set 'table.changelog.image' to 'FULL' or remove the setting.");
+
+        // Test 2: Aggregate + FULL should be allowed
+        TablePath tablePath2 = TablePath.of("fluss", "test_aggregate_full_changelog_allowed");
+        Map<String, String> properties2 = new HashMap<>();
+        properties2.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "aggregation");
+        properties2.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "FULL");
+        TableDescriptor tableDescriptor2 =
+                TableDescriptor.builder()
+                        .schema(aggregateSchema)
+                        .comment("aggregate merge engine table with FULL changelog")
+                        .properties(properties2)
+                        .build();
+        admin.createTable(tablePath2, tableDescriptor2, false).get();
+        assertThat(admin.tableExists(tablePath2).get()).isTrue();
+
+        // Test 3: Aggregate + default (no explicit changelog image) should be allowed
+        TablePath tablePath3 = TablePath.of("fluss", "test_aggregate_default_changelog_allowed");
+        Map<String, String> properties3 = new HashMap<>();
+        properties3.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "aggregation");
+        // No explicit changelog image setting - defaults to FULL
+        TableDescriptor tableDescriptor3 =
+                TableDescriptor.builder()
+                        .schema(aggregateSchema)
+                        .comment("aggregate merge engine table with default changelog")
+                        .properties(properties3)
+                        .build();
+        admin.createTable(tablePath3, tableDescriptor3, false).get();
+        assertThat(admin.tableExists(tablePath3).get()).isTrue();
+
+        // Test 4: WAL + no merge engine should be allowed
+        TablePath tablePath4 = TablePath.of("fluss", "test_wal_no_merge_engine_allowed");
+        Map<String, String> properties4 = new HashMap<>();
+        properties4.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
+        // No merge engine setting
+        TableDescriptor tableDescriptor4 =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("primary key table with WAL changelog and no merge engine")
+                        .properties(properties4)
+                        .build();
+        admin.createTable(tablePath4, tableDescriptor4, false).get();
+        assertThat(admin.tableExists(tablePath4).get()).isTrue();
+
+        // Test 5: FIRST_ROW + WAL should be allowed
+        TablePath tablePath5 = TablePath.of("fluss", "test_first_row_wal_changelog_allowed");
+        Map<String, String> properties5 = new HashMap<>();
+        properties5.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "first_row");
+        properties5.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
+        TableDescriptor tableDescriptor5 =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("first_row merge engine table with WAL changelog")
+                        .properties(properties5)
+                        .build();
+        admin.createTable(tablePath5, tableDescriptor5, false).get();
+        assertThat(admin.tableExists(tablePath5).get()).isTrue();
+
+        // Test 6: VERSIONED + WAL should be allowed
+        TablePath tablePath6 = TablePath.of("fluss", "test_versioned_wal_changelog_allowed");
+        Map<String, String> properties6 = new HashMap<>();
+        properties6.put(ConfigOptions.TABLE_MERGE_ENGINE.key(), "versioned");
+        properties6.put(ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN.key(), "age");
+        properties6.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
+        TableDescriptor tableDescriptor6 =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .comment("versioned merge engine table with WAL changelog")
+                        .properties(properties6)
+                        .build();
+        admin.createTable(tablePath6, tableDescriptor6, false).get();
+        assertThat(admin.tableExists(tablePath6).get()).isTrue();
+    }
+
+    // ==================== Table Statistics Tests ====================
+
+    @Test
+    void testGetTableStatsForPrimaryKeyTableWithFailover() throws Exception {
+        // Create a primary key table
+        TablePath tablePath = TablePath.of("test_db", "test_pk_table_stats");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(DEFAULT_SCHEMA).distributedBy(3, "id").build();
+        long tableId = createTable(tablePath, tableDescriptor, true);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        // Initially, row count should be 0
+        assertThat(admin.getTableStats(tablePath).get().getRowCount()).isEqualTo(0);
+
+        // Insert some data
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            for (int i = 0; i < 100; i++) {
+                upsertWriter.upsert(row(i, "name" + i, i % 50));
+            }
+            upsertWriter.flush();
+        }
+        assertThat(admin.getTableStats(tablePath).get().getRowCount()).isEqualTo(100);
+
+        // Delete some rows, update some rows, insert some rows
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            for (int i = 0; i < 30; i++) {
+                upsertWriter.delete(row(i, null, null));
+            }
+            upsertWriter.flush();
+        }
+        assertThat(admin.getTableStats(tablePath).get().getRowCount()).isEqualTo(70);
+
+        // snapshot the row count
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tablePath);
+        // restart all the servers
+        for (int i = 0; i < FLUSS_CLUSTER_EXTENSION.getTabletServerNodes().size(); i++) {
+            FLUSS_CLUSTER_EXTENSION.stopTabletServer(i);
+            FLUSS_CLUSTER_EXTENSION.startTabletServer(i);
+        }
+
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        // reconnect with the restarted cluster
+        Connection newConn = ConnectionFactory.createConnection(clientConf);
+        try (Table table = newConn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            // update existed rows shouldn't increase row count
+            for (int i = 50; i < 90; i++) {
+                upsertWriter.upsert(row(i, "updated_name" + i, i % 50));
+            }
+            for (int i = 200; i < 300; i++) {
+                upsertWriter.upsert(row(i, "name" + i, i % 50));
+            }
+            upsertWriter.flush();
+        }
+        // Final row count should be 170
+        assertThat(newConn.getAdmin().getTableStats(tablePath).get().getRowCount()).isEqualTo(170);
+        newConn.close();
+    }
+
+    @Test
+    void testGetTableStatsForLogTable() throws Exception {
+        // Create a log table (no primary key)
+        Schema logTableSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("age", DataTypes.INT())
+                        .build();
+        TablePath tablePath = TablePath.of("test_db", "test_log_table_stats");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(logTableSchema).distributedBy(3).build();
+        long tableId = createTable(tablePath, tableDescriptor, true);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
+
+        // Initially, row count should be 0
+        assertThat(admin.getTableStats(tablePath).get().getRowCount()).isEqualTo(0);
+
+        // Append some data
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter appendWriter = table.newAppend().createWriter();
+            for (int i = 0; i < 50; i++) {
+                appendWriter.append(row(i, "name" + i, i % 30));
+            }
+            appendWriter.flush();
+        }
+
+        assertThat(admin.getTableStats(tablePath).get().getRowCount()).isEqualTo(50);
+    }
+
+    @Test
+    void testGetTableStatsForPartitionedTable() throws Exception {
+        // Create a partitioned primary key table
+        Schema partitionedSchema =
+                Schema.newBuilder()
+                        .primaryKey("id", "dt")
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("dt", DataTypes.STRING())
+                        .build();
+        TablePath tablePath = TablePath.of("test_db", "test_partitioned_table_stats");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(partitionedSchema)
+                        .distributedBy(2, "id")
+                        .partitionedBy("dt")
+                        .build();
+        long tableId = createTable(tablePath, tableDescriptor, true);
+
+        // Create partitions
+        admin.createPartition(tablePath, newPartitionSpec("dt", "2024-01-01"), false).get();
+        admin.createPartition(tablePath, newPartitionSpec("dt", "2024-01-02"), false).get();
+        admin.listPartitionInfos(tablePath)
+                .join()
+                .forEach(
+                        partition -> {
+                            FLUSS_CLUSTER_EXTENSION.waitUntilTablePartitionReady(
+                                    tableId, partition.getPartitionId());
+                        });
+
+        // Initially, row count should be 0
+        assertThat(admin.getTableStats(tablePath).get().getRowCount()).isEqualTo(0);
+
+        // Insert data into different partitions
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            // 30 rows in partition 2024-01-01
+            for (int i = 0; i < 30; i++) {
+                upsertWriter.upsert(row(i, "name" + i, "2024-01-01"));
+            }
+            // 20 rows in partition 2024-01-02
+            for (int i = 0; i < 20; i++) {
+                upsertWriter.upsert(row(i, "name" + i, "2024-01-02"));
+            }
+            upsertWriter.flush();
+        }
+        // Total row count should be 50
+        assertThat(admin.getTableStats(tablePath).get().getRowCount()).isEqualTo(50);
+    }
+
+    @Test
+    void testGetTableStatsForWalChangelogModeTable() throws Exception {
+        // Create a primary key table with WAL changelog mode (row count disabled)
+        TablePath tablePath = TablePath.of("test_db", "test_wal_changelog_table_stats");
+        Map<String, String> properties = new HashMap<>();
+        properties.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_SCHEMA)
+                        .distributedBy(3, "id")
+                        .properties(properties)
+                        .build();
+        createTable(tablePath, tableDescriptor, true);
+
+        // Insert some data
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            for (int i = 0; i < 10; i++) {
+                upsertWriter.upsert(row(i, "name" + i, i % 5));
+            }
+            upsertWriter.flush();
+        }
+
+        // Getting table stats should throw exception for WAL changelog mode tables
+        assertThatThrownBy(() -> admin.getTableStats(tablePath).get())
+                .cause()
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining("Row count is disabled for this table");
+    }
+
+    @Test
+    void testKvSnapshotLeaseForLogTable() throws Exception {
+        // Create a log table (without primary key)
+        TablePath logTablePath = TablePath.of("test_db", "test_log_table_kv_lease");
+        Schema logSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("age", DataTypes.INT())
+                        .build();
+        TableDescriptor logTableDescriptor =
+                TableDescriptor.builder().schema(logSchema).distributedBy(3).build();
+        long tableId = createTable(logTablePath, logTableDescriptor, true);
+
+        // Create a KvSnapshotLease
+        KvSnapshotLease lease = admin.createKvSnapshotLease("test-lease-log", 60000);
+
+        // Test acquireSnapshots should fail for log table
+        Map<TableBucket, Long> snapshotIds = new HashMap<>();
+        snapshotIds.put(new TableBucket(tableId, 0), 0L);
+        assertThatThrownBy(() -> lease.acquireSnapshots(snapshotIds).get())
+                .cause()
+                .isInstanceOf(NonPrimaryKeyTableException.class)
+                .hasMessageContaining("is not a primary key table");
+
+        // Test releaseSnapshots should fail for log table
+        assertThatThrownBy(
+                        () ->
+                                lease.releaseSnapshots(
+                                                Collections.singleton(new TableBucket(tableId, 0)))
+                                        .get())
+                .cause()
+                .isInstanceOf(NonPrimaryKeyTableException.class)
+                .hasMessageContaining("is not a primary key table");
     }
 }
