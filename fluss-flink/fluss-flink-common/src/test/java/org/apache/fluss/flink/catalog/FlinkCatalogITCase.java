@@ -26,6 +26,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidConfigException;
+import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.metadata.DataLakeFormat;
@@ -41,6 +42,7 @@ import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.catalog.CatalogBaseTable;
+import org.apache.flink.table.catalog.CatalogDatabase;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
@@ -249,53 +251,39 @@ abstract class FlinkCatalogITCase {
 
         // alter table set an unsupported modification option should throw exception
         String unSupportedDml1 =
-                "alter table test_alter_table_append_only set ('table.auto-partition.enabled' = 'true')";
+                "alter table test_alter_table_append_only set ('table.auto-partition.enabled' = 'true', 'table.kv.format' = 'indexed')";
 
         assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml1))
                 .rootCause()
                 .isInstanceOf(InvalidAlterTableException.class)
-                .hasMessage(
-                        "The option 'table.auto-partition.enabled' is not supported to alter yet.");
+                .hasMessageContaining("The following options are not supported to alter yet:")
+                .hasMessageContaining("table.kv.format")
+                .hasMessageContaining("table.auto-partition.enabled");
 
         String unSupportedDml2 =
-                "alter table test_alter_table_append_only set ('k1' = 'v1', 'table.kv.format' = 'indexed')";
-        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml2))
-                .rootCause()
-                .isInstanceOf(InvalidAlterTableException.class)
-                .hasMessage("The option 'table.kv.format' is not supported to alter yet.");
-
-        String unSupportedDml3 =
                 "alter table test_alter_table_append_only set ('bucket.num' = '1000')";
-        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml3))
+        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml2))
                 .rootCause()
                 .isInstanceOf(CatalogException.class)
                 .hasMessage("The option 'bucket.num' is not supported to alter yet.");
 
-        String unSupportedDml4 =
+        String unSupportedDml3 =
                 "alter table test_alter_table_append_only set ('bucket.key' = 'a')";
-        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml4))
+        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml3))
                 .rootCause()
                 .isInstanceOf(CatalogException.class)
                 .hasMessage("The option 'bucket.key' is not supported to alter yet.");
 
-        String unSupportedDml5 =
+        String unSupportedDml4 =
                 "alter table test_alter_table_append_only reset ('bootstrap.servers')";
-        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml5))
+        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml4))
                 .rootCause()
                 .isInstanceOf(CatalogException.class)
                 .hasMessage("The option 'bootstrap.servers' is not supported to alter yet.");
 
-        String unSupportedDml6 =
-                "alter table test_alter_table_append_only set ('paimon.file.format' = 'orc')";
-        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml6))
-                .rootCause()
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessage(
-                        "Property 'paimon.file.format' is not supported to alter which is for datalake table.");
-
-        String unSupportedDml7 =
+        String unSupportedDml5 =
                 "alter table test_alter_table_append_only set ('auto-increment.fields' = 'b')";
-        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml7))
+        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml5))
                 .rootCause()
                 .isInstanceOf(CatalogException.class)
                 .hasMessage("The option 'auto-increment.fields' is not supported to alter yet.");
@@ -552,12 +540,16 @@ abstract class FlinkCatalogITCase {
                         .format(DateTimeFormatter.ofPattern(datetimePattern));
 
         // 2. test add partitions.
-        tEnv.executeSql(
-                String.format(
-                        "alter table %s add partition (b = 1,c = 1,hh = %s)", tblName, minus3hour));
-        tEnv.executeSql(
-                String.format(
-                        "alter table %s add partition (b = 1,c = 2,hh = %s)", tblName, minus3hour));
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        String.format(
+                                                "alter table %s add partition (b = 1,c = 1,hh = %s)",
+                                                tblName, minus3hour)))
+                .rootCause()
+                .isInstanceOf(InvalidPartitionException.class)
+                .hasMessageContaining(
+                        String.format("Partition value '%s' is out-of-date.", minus3hour));
         tEnv.executeSql(
                 String.format(
                         "alter table %s add partition (b = 1,c = 1,hh = %s)", tblName, minus2hour));
@@ -650,8 +642,8 @@ abstract class FlinkCatalogITCase {
             expectedCustomProperties.put("schema.4.name", "cost");
             expectedCustomProperties.put("schema.4.expr", "`price` * `quantity`");
             expectedCustomProperties.put("schema.4.data-type", "DOUBLE");
-            expectedCustomProperties.put("bucket.num", "2");
             assertThat(tableInfo.getCustomProperties().toMap()).isEqualTo(expectedCustomProperties);
+            assertThat(tableInfo.getNumBuckets()).isEqualTo(2);
         }
     }
 
@@ -697,6 +689,37 @@ abstract class FlinkCatalogITCase {
         tEnv.executeSql("drop database test_db");
         databases = CollectionUtil.iteratorToList(tEnv.executeSql("show databases").collect());
         assertThat(databases.toString()).isEqualTo(String.format("[+I[%s]]", DEFAULT_DB));
+    }
+
+    @Test
+    void testAlterDatabase() throws Exception {
+        String dbName = "test_alter_db";
+        // Create database with initial properties
+        tEnv.executeSql(
+                String.format(
+                        "create database %s comment 'initial comment' with ('key1' = 'value1', 'key2' = 'value2')",
+                        dbName));
+
+        // Verify initial state
+        CatalogDatabase currentDb = catalog.getDatabase(dbName);
+        assertThat(currentDb.getProperties()).containsEntry("key1", "value1");
+        assertThat(currentDb.getProperties()).containsEntry("key2", "value2");
+        assertThat(currentDb.getComment()).isEqualTo("initial comment");
+
+        // Alter database: add new property and update existing property
+        String alterSql1 =
+                "alter database " + dbName + " set ('key3' = 'value3', 'key1' = 'updated_value1')";
+        tEnv.executeSql(alterSql1);
+
+        // Verify first alteration
+        CatalogDatabase alteredDb1 = catalog.getDatabase(dbName);
+        assertThat(alteredDb1.getProperties()).containsEntry("key1", "updated_value1");
+        assertThat(alteredDb1.getProperties()).containsEntry("key2", "value2");
+        assertThat(alteredDb1.getProperties()).containsEntry("key3", "value3");
+        assertThat(alteredDb1.getComment()).isEqualTo("initial comment");
+
+        // Drop database for cleanup
+        tEnv.executeSql("drop database " + dbName);
     }
 
     @Test

@@ -96,8 +96,59 @@ public class ConfigOptions {
                     .stringType()
                     .noDefaultValue()
                     .withDescription(
-                            "The directory used for storing the kv snapshot data files and remote log for log tiered storage "
-                                    + " in a Fluss supported filesystem.");
+                            "The directory used for storing the kv snapshot data files and remote log for log tiered storage"
+                                    + " in a Fluss supported filesystem. "
+                                    + "When upgrading to `remote.data.dirs`, please ensure this value is placed as the first entry in the new configuration."
+                                    + "For new clusters, it is recommended to use `remote.data.dirs` instead. "
+                                    + "If `remote.data.dirs` is configured, this value will be ignored.");
+
+    public static final ConfigOption<List<String>> REMOTE_DATA_DIRS =
+            key("remote.data.dirs")
+                    .stringType()
+                    .asList()
+                    .defaultValues()
+                    .withDescription(
+                            "A comma-separated list of directories in Fluss supported filesystems "
+                                    + "for storing the kv snapshot data files and remote log files of tables/partitions. "
+                                    + "If configured, when a new table or a new partition is created, "
+                                    + "one of the directories from this list will be selected according to the strategy "
+                                    + "specified by `remote.data.dirs.strategy` (`ROUND_ROBIN` by default). "
+                                    + "If not configured, the system uses `"
+                                    + REMOTE_DATA_DIR.key()
+                                    + "` as the sole remote data directory for all data.");
+
+    public static final ConfigOption<RemoteDataDirStrategy> REMOTE_DATA_DIRS_STRATEGY =
+            key("remote.data.dirs.strategy")
+                    .enumType(RemoteDataDirStrategy.class)
+                    .defaultValue(RemoteDataDirStrategy.ROUND_ROBIN)
+                    .withDescription(
+                            String.format(
+                                    "The strategy for selecting the remote data directory from `%s`. "
+                                            + "The candidate strategies are: %s, the default strategy is %s.\n"
+                                            + "%s: this strategy employs a round-robin approach to select one from the available remote directories.\n"
+                                            + "%s: this strategy selects one of the available remote directories based on the weights configured in `remote.data.dirs.weights`.",
+                                    REMOTE_DATA_DIRS.key(),
+                                    Arrays.toString(RemoteDataDirStrategy.values()),
+                                    RemoteDataDirStrategy.ROUND_ROBIN,
+                                    RemoteDataDirStrategy.ROUND_ROBIN,
+                                    RemoteDataDirStrategy.WEIGHTED_ROUND_ROBIN));
+
+    public static final ConfigOption<List<Integer>> REMOTE_DATA_DIRS_WEIGHTS =
+            key("remote.data.dirs.weights")
+                    .intType()
+                    .asList()
+                    .defaultValues()
+                    .withDescription(
+                            "The weights of the remote data directories. "
+                                    + "This is a list of weights corresponding to the `"
+                                    + REMOTE_DATA_DIRS.key()
+                                    + "` in the same order. When `"
+                                    + REMOTE_DATA_DIRS_STRATEGY.key()
+                                    + "` is set to `"
+                                    + RemoteDataDirStrategy.WEIGHTED_ROUND_ROBIN
+                                    + "`, this must be configured, and its size must be equal to `"
+                                    + REMOTE_DATA_DIRS.key()
+                                    + "`; otherwise, it will be ignored.");
 
     public static final ConfigOption<MemorySize> REMOTE_FS_WRITE_BUFFER_SIZE =
             key("remote.fs.write-buffer-size")
@@ -797,6 +848,16 @@ public class ConfigOptions {
                             "Interval at which remote log manager runs the scheduled tasks like "
                                     + "copy segments, clean up remote log segments, delete local log segments etc. "
                                     + "If the value is set to 0, it means that the remote log storage is disabled.");
+
+    public static final ConfigOption<Integer> REMOTE_LOG_TASK_MAX_UPLOAD_SEGMENTS =
+            key("remote.log.task-max-upload-segments")
+                    .intType()
+                    .defaultValue(5)
+                    .withDescription(
+                            "The maximum number of log segments to upload to remote storage per "
+                                    + "tiering task execution. This limits the upload batch size to "
+                                    + "prevent overwhelming the remote storage when there is a large "
+                                    + "backlog of segments to upload.");
 
     public static final ConfigOption<MemorySize> REMOTE_LOG_INDEX_FILE_CACHE_SIZE =
             key("remote.log.index-file-cache-size")
@@ -1518,6 +1579,22 @@ public class ConfigOptions {
                                     + "This mode reduces storage and transmission costs but loses the ability to track previous values. "
                                     + "This option only affects primary key tables.");
 
+    public static final ConfigOption<String> TABLE_STATISTICS_COLUMNS =
+            key("table.statistics.columns")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Configures column-level statistics collection for the table. "
+                                    + "By default this option is not set and no column statistics are collected. "
+                                    + "The value '*' means collect statistics for all supported columns. "
+                                    + "A comma-separated list of column names means collect statistics only for the specified columns. "
+                                    + "Supported types include: BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE, "
+                                    + "STRING, CHAR, DECIMAL, DATE, TIME, TIMESTAMP, and TIMESTAMP_LTZ. "
+                                    + "Example: 'id,name,timestamp' to collect statistics only for specified columns. "
+                                    + "Note: enabling column statistics requires the V1 batch format. "
+                                    + "Downstream consumers must be upgraded to Fluss v1.0+ before enabling this option, "
+                                    + "as older versions cannot parse the extended batch format.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv
     // ------------------------------------------------------------------------
@@ -2065,5 +2142,11 @@ public class ConfigOptions {
     @Internal
     public static ConfigOption<?> getConfigOption(String key) {
         return ConfigOptionsHolder.CONFIG_OPTIONS_BY_KEY.get(key);
+    }
+
+    /** Remote data dir select strategy for Fluss. */
+    public enum RemoteDataDirStrategy {
+        ROUND_ROBIN,
+        WEIGHTED_ROUND_ROBIN
     }
 }

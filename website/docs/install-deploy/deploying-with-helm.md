@@ -36,7 +36,7 @@ the installation documentation provides instructions for deploying one using Bit
 
 ### Running Fluss locally with Minikube
 
-For local testing and development, you can deploy Fluss on Minikube. This is ideal for development, testing, and learning purposes.
+For local testing and development, you can deploy Fluss on Minikube. This is ideal for development, testing and learning purposes.
 
 #### Prerequisites
 
@@ -139,7 +139,7 @@ The Fluss Helm chart deploys the following Kubernetes resources:
 - **CoordinatorServer**: 1x StatefulSet with Headless Service for cluster coordination
 - **TabletServer**: 3x StatefulSet with Headless Service for data storage and processing
 - **ConfigMap**: Configuration management for `server.yaml` settings
-- **Services**: Headless services providing stable pod DNS names
+- **Services**: Headless services providing stable pod DNS names, plus optional dedicated headless services when metrics are enabled
 
 ### Step 3: Verify Installation
 
@@ -157,7 +157,7 @@ kubectl logs -l app.kubernetes.io/component=tablet
 
 ## Configuration Parameters
 
-The following table lists the configurable parameters of the Fluss chart and their default values.
+The following table lists the configurable parameters of the Fluss chart, and their default values.
 
 ### Global Parameters
 
@@ -182,6 +182,45 @@ The following table lists the configurable parameters of the Fluss chart and the
 |-----------|-------------|---------|
 | `listeners.internal.port` | Internal communication port | `9123` |
 | `listeners.client.port` | Client port (intra-cluster) | `9124` |
+
+### Security Configuration
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `security.client.sasl.mechanism` | Client listener SASL mechanism (`""`, `plain`) | `""` |
+| `security.internal.sasl.mechanism` | Internal listener SASL mechanism (`""`, `plain`) | `""` |
+| `security.client.sasl.plain.users` | Client listener username and password pairs for PLAIN | `[]` |
+| `security.internal.sasl.plain.username` | Internal listener PLAIN username | `""` |
+| `security.internal.sasl.plain.password` | Internal listener PLAIN password | `""` |
+
+Only `plain` mechanism is supported for now. An empty string disables the SASL authentication, and maps to the `PLAINTEXT` protocol.
+
+If the internal SASL username or password is left empty, the chart automatically generates credentials based on the Helm release name:
+
+- Username is set to the `"fluss-internal-user-<release-name>"`
+- Password is set to the SHA-256 hash of `"fluss-internal-password-<release-name>"`
+
+It is recommended to set these explicitly in production.
+
+#### ZooKeeper SASL Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `security.zookeeper.sasl.mechanism` | ZooKeeper SASL mechanism (`""`, `plain`) | `""` |
+| `security.zookeeper.sasl.plain.username` | ZooKeeper SASL username | `""` |
+| `security.zookeeper.sasl.plain.password` | ZooKeeper SASL password | `""` |
+| `security.zookeeper.sasl.plain.loginModuleClass` | JAAS login module class for ZooKeeper | `org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.server.auth.DigestLoginModule` |
+
+### Metrics Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `metrics.reporters` | Comma-separated reporter selector; use `""` to disable metrics | `""` |
+| `metrics.jmx.port` | JMX reporter port range | `9250` |
+| `metrics.prometheus.port` | Prometheus reporter port | `9249` |
+| `metrics.prometheus.service.portName` | Named port exposed on metrics services | `metrics` |
+| `metrics.prometheus.service.labels` | Additional labels added to metrics services | `{}` |
+| `metrics.prometheus.service.annotations` | Optional annotations added to metrics services | `{}` |
 
 ### Fluss Configuration Overrides
 
@@ -253,6 +292,120 @@ listeners:
     port: 9123
   client:
     port: 9124
+
+security:
+  client:
+    sasl:
+      mechanism: ""
+  internal:
+    sasl:
+      mechanism: ""
+```
+
+### Enabling Secure Connection
+
+With the helm deployment, you can specify authentication mechanisms when connecting to the Fluss cluster.
+
+The following table shows the supported mechanisms and security they provide:
+
+| Mechanism | Method      | Authentication | TLS Encryption     |
+|:---------:|:-----------:|:--------------:|:------------------:|
+| `""`      | `PLAINTEXT` | No             | No                 |
+| `plain`   | `SASL`      | Yes            | No                 |
+
+By default, the `PLAINTEXT` protocol is used.
+
+You can set the SASL authentication by enabling `plain` mechanism.
+
+```yaml
+security:
+  client:
+    sasl:
+      mechanism: plain
+      plain:
+        users:
+          - username: client-user
+            password: client-password
+  internal:
+    sasl:
+      mechanism: plain
+      plain:
+        username: internal-user
+        password: internal-password
+```
+
+### Enabling ZooKeeper SASL Authentication
+
+You can enable ZooKeeper ensemble SASL authentication, with the following values in the Fluss Helm chart:
+
+```yaml
+security:
+  zookeeper:
+    sasl:
+      mechanism: plain
+      plain:
+        username: fluss-zk-user
+        password: fluss-zk-password
+```
+
+The `security.zookeeper.sasl.plain.username` and `security.zookeeper.sasl.plain.password` fields are required when `security.zookeeper.sasl.mechanism` is set to `plain`.
+
+ZooKeeper SASL can be enabled independently or together with the listeners SASL authentication.
+
+### Metrics and Monitoring
+
+When `metrics.reporters` is set, the chart adds the following `server.yaml` configuration entries:
+
+- `metrics.reporters`: comma-separated reporter names from `metrics.reporters`
+- `metrics.reporter.<name>.port`: port value from `metrics.<name>.port`
+
+These values are managed by the chart and cannot be set via `configurationOverrides`. All other metrics reporter options (refer to the [Fluss configuration](https://fluss.apache.org/docs/maintenance/configuration/#metrics)) should be specified via `configurationOverrides`.
+
+#### Prometheus Annotation Based Scraping
+
+The example values below show how to add annotations to the metrics services so that a Prometheus server can discover and scrape them automatically based on the annotations:
+
+```yaml
+metrics:
+  reporters: prometheus
+  prometheus:
+    port: 9249
+    service:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9249"
+```
+
+#### Prometheus ServiceMonitor Based Scraping
+
+Similarly, if using the [Prometheus Operator](https://prometheus-operator.dev/), use the values below to add labels to the metrics services:
+
+```yaml
+metrics:
+  reporters: prometheus
+  prometheus:
+    port: 9249
+    service:
+      portName: metrics
+      labels:
+        monitoring: enabled
+```
+
+Then create a [`ServiceMonitor`](https://prometheus-operator.dev/docs/api-reference/api/#monitoring.coreos.com/v1.ServiceMonitor) that selects them matching the labels:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluss-metrics
+spec:
+  selector:
+    matchLabels:
+      monitoring: enabled
+  endpoints:
+    # Matches `metrics.prometheus.service.portName`
+    - port: metrics
 ```
 
 ### Storage Configuration

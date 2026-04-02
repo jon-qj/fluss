@@ -20,6 +20,7 @@ package org.apache.fluss.rpc.protocol;
 import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.AuthenticationException;
 import org.apache.fluss.exception.AuthorizationException;
+import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.DatabaseAlreadyExistException;
@@ -55,6 +56,7 @@ import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.exception.NoRebalanceInProgressException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
+import org.apache.fluss.exception.NotCoordinatorLeaderException;
 import org.apache.fluss.exception.NotEnoughReplicasAfterAppendException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
@@ -245,7 +247,12 @@ public enum Errors {
     INVALID_PRODUCER_ID_EXCEPTION(
             63,
             "The client has attempted to perform an operation with an invalid producer ID.",
-            InvalidProducerIdException::new);
+            InvalidProducerIdException::new),
+    CONFIG_EXCEPTION(64, "A configuration error occurred.", ConfigException::new),
+    NOT_COORDINATOR_LEADER_EXCEPTION(
+            65,
+            "The coordinator is not a leader and cannot process request.",
+            NotCoordinatorLeaderException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 

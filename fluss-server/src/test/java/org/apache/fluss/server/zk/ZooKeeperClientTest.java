@@ -29,7 +29,6 @@ import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
-import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
 import org.apache.fluss.server.zk.data.BucketAssignment;
@@ -37,6 +36,7 @@ import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
@@ -84,6 +84,7 @@ class ZooKeeperClientTest {
             new AllCallbackWrapper<>(new ZooKeeperExtension());
 
     private static ZooKeeperClient zookeeperClient;
+    private static String remoteDataDir;
 
     @BeforeAll
     static void beforeAll() {
@@ -91,6 +92,7 @@ class ZooKeeperClientTest {
                 ZOO_KEEPER_EXTENSION_WRAPPER
                         .getCustomExtension()
                         .getZooKeeperClient(NOPErrorHandler.INSTANCE);
+        remoteDataDir = zookeeperClient.getDefaultRemoteDataDir();
     }
 
     @AfterEach
@@ -107,14 +109,14 @@ class ZooKeeperClientTest {
     void testCoordinatorLeader() throws Exception {
         // try to get leader address, should return empty since node leader address stored in
         // zk
-        assertThat(zookeeperClient.getCoordinatorAddress()).isEmpty();
+        assertThat(zookeeperClient.getCoordinatorLeaderAddress()).isEmpty();
         CoordinatorAddress coordinatorAddress =
                 new CoordinatorAddress(
                         "2", Endpoint.fromListenersString("CLIENT://localhost1:10012"));
         // register leader address
         zookeeperClient.registerCoordinatorLeader(coordinatorAddress);
         // check get leader address
-        CoordinatorAddress gottenAddress = zookeeperClient.getCoordinatorAddress().get();
+        CoordinatorAddress gottenAddress = zookeeperClient.getCoordinatorLeaderAddress().get();
         assertThat(gottenAddress).isEqualTo(coordinatorAddress);
     }
 
@@ -331,6 +333,7 @@ class ZooKeeperClientTest {
                         new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
                         options,
                         Collections.singletonMap("custom-1", "100"),
+                        remoteDataDir,
                         currentMillis,
                         currentMillis);
         TableRegistration tableReg2 =
@@ -341,6 +344,7 @@ class ZooKeeperClientTest {
                         new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
                         options,
                         Collections.singletonMap("custom-2", "200"),
+                        remoteDataDir,
                         currentMillis,
                         currentMillis);
         zookeeperClient.registerTable(tablePath1, tableReg1);
@@ -366,6 +370,7 @@ class ZooKeeperClientTest {
                         new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
                         options,
                         Collections.singletonMap("custom-3", "300"),
+                        remoteDataDir,
                         currentMillis,
                         currentMillis);
         zookeeperClient.updateTable(tablePath1, tableReg1);
@@ -550,6 +555,7 @@ class ZooKeeperClientTest {
                         new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
                         Collections.emptyMap(),
                         Collections.emptyMap(),
+                        remoteDataDir,
                         currentMillis,
                         currentMillis);
         zookeeperClient.registerTable(tablePath, tableReg);
@@ -571,14 +577,14 @@ class ZooKeeperClientTest {
                                         })
                                 .getBucketAssignments());
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                1L, "p1", partitionAssignment, tablePath, tableId);
+                1L, "p1", partitionAssignment, remoteDataDir, tablePath, tableId);
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                2L, "p2", partitionAssignment, tablePath, tableId);
+                2L, "p2", partitionAssignment, remoteDataDir, tablePath, tableId);
 
         // check created partitions
         partitions = zookeeperClient.getPartitions(tablePath);
         assertThat(partitions).containsExactly("p1", "p2");
-        TablePartition partition = zookeeperClient.getPartition(tablePath, "p1").get();
+        PartitionRegistration partition = zookeeperClient.getPartition(tablePath, "p1").get();
         assertThat(partition.getPartitionId()).isEqualTo(1L);
         partition = zookeeperClient.getPartition(tablePath, "p2").get();
         assertThat(partition.getPartitionId()).isEqualTo(2L);
@@ -677,6 +683,7 @@ class ZooKeeperClientTest {
         config.setString(
                 ConfigOptions.ZOOKEEPER_ADDRESS,
                 ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().getConnectString());
+        config.set(ConfigOptions.REMOTE_DATA_DIR, remoteDataDir.toString());
         config.setString(ConfigOptions.ZOOKEEPER_CONFIG_PATH, "./no-file.properties");
         assertThatThrownBy(
                         () -> ZooKeeperUtils.startZookeeperClient(config, NOPErrorHandler.INSTANCE))
@@ -703,11 +710,13 @@ class ZooKeeperClientTest {
 
     @Test
     void testGetDatabaseSummary() throws Exception {
-        TablePath tablePath = TablePath.of("db", "tb1");
+        TablePath tablePath1 = TablePath.of("db", "tb1");
+        TablePath tablePath2 = TablePath.of("db", "tb2");
+        TablePath tablePath3 = TablePath.of("db2", "tb1");
 
         assertThat(
                         zookeeperClient.listDatabaseSummaries(
-                                Collections.singletonList(tablePath.getDatabaseName())))
+                                Collections.singletonList(tablePath1.getDatabaseName())))
                 .isEmpty();
 
         // register table.
@@ -720,20 +729,51 @@ class ZooKeeperClientTest {
                         new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
                         Collections.emptyMap(),
                         Collections.emptyMap(),
+                        remoteDataDir,
                         beforeCreateTime,
                         beforeCreateTime);
-        zookeeperClient.registerTable(tablePath, tableReg1);
-
+        zookeeperClient.registerTable(tablePath1, tableReg1);
         long afterCreateTime = System.currentTimeMillis();
+
+        TableRegistration tableReg2 =
+                new TableRegistration(
+                        12,
+                        "second table",
+                        Arrays.asList("a", "b"),
+                        new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        remoteDataDir,
+                        beforeCreateTime,
+                        beforeCreateTime);
+        zookeeperClient.registerTable(tablePath2, tableReg2);
+
+        TableRegistration tableReg3 =
+                new TableRegistration(
+                        13,
+                        "third table",
+                        Arrays.asList("a", "b"),
+                        new TableDescriptor.TableDistribution(16, Collections.singletonList("a")),
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        remoteDataDir,
+                        beforeCreateTime,
+                        beforeCreateTime);
+        zookeeperClient.registerTable(tablePath3, tableReg3);
+
         List<DatabaseSummary> databaseSummaries =
                 zookeeperClient.listDatabaseSummaries(
-                        Collections.singletonList(tablePath.getDatabaseName()));
-        assertThat(databaseSummaries).hasSize(1);
+                        Arrays.asList(tablePath1.getDatabaseName(), tablePath3.getDatabaseName()));
+        assertThat(databaseSummaries).hasSize(2);
         DatabaseSummary databaseSummary = databaseSummaries.get(0);
         assertThat(databaseSummary.getDatabaseName()).isEqualTo("db");
-        assertThat(databaseSummary.getTableCount()).isEqualTo(1);
+        assertThat(databaseSummary.getTableCount()).isEqualTo(2);
         assertThat(databaseSummary.getCreatedTime())
                 .isGreaterThanOrEqualTo(beforeCreateTime)
                 .isLessThanOrEqualTo(afterCreateTime);
+        databaseSummary = databaseSummaries.get(1);
+        assertThat(databaseSummary.getDatabaseName()).isEqualTo("db2");
+        assertThat(databaseSummary.getTableCount()).isEqualTo(1);
+        assertThat(databaseSummary.getCreatedTime()).isGreaterThan(afterCreateTime);
     }
 }

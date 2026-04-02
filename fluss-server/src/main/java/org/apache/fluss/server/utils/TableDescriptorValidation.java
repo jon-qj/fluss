@@ -121,36 +121,52 @@ public class TableDescriptorValidation {
     }
 
     public static void validateAlterTableProperties(
-            TableInfo currentTable, Set<String> tableKeysToChange, Set<String> customKeysToChange) {
+            TableInfo currentTable, Set<String> tableKeysToChange) {
         TableConfig currentConfig = currentTable.getTableConfig();
-        tableKeysToChange.forEach(
-                k -> {
-                    if (isTableStorageConfig(k) && !isAlterableTableOption(k)) {
-                        throw new InvalidAlterTableException(
-                                "The option '" + k + "' is not supported to alter yet.");
-                    }
 
-                    if (!currentConfig.getDataLakeFormat().isPresent()
-                            && ConfigOptions.TABLE_DATALAKE_ENABLED.key().equals(k)) {
-                        throw new InvalidAlterTableException(
-                                String.format(
-                                        "The option '%s' cannot be altered for tables that were"
-                                                + " created before the Fluss cluster enabled datalake.",
-                                        ConfigOptions.TABLE_DATALAKE_ENABLED.key()));
-                    }
-                });
+        List<String> unsupportedKeys =
+                tableKeysToChange.stream()
+                        .filter(k -> isTableStorageConfig(k) && !isAlterableTableOption(k))
+                        .collect(Collectors.toList());
+        if (!unsupportedKeys.isEmpty()) {
+            throw new InvalidAlterTableException(
+                    String.format(
+                            "The following options are not supported to alter yet: %s.",
+                            unsupportedKeys.stream()
+                                    .map(k -> "'" + k + "'")
+                                    .collect(Collectors.joining(", "))));
+        }
 
-        if (currentConfig.isDataLakeEnabled() && currentConfig.getDataLakeFormat().isPresent()) {
-            String format = currentConfig.getDataLakeFormat().get().toString();
-            customKeysToChange.forEach(
-                    k -> {
-                        if (k.startsWith(format + ".")) {
-                            throw new InvalidConfigException(
-                                    String.format(
-                                            "Property '%s' is not supported to alter which is for datalake table.",
-                                            k));
-                        }
-                    });
+        if (!currentConfig.getDataLakeFormat().isPresent()) {
+            List<String> datalakeKeys =
+                    tableKeysToChange.stream()
+                            .filter(k -> k.startsWith("table.datalake."))
+                            .collect(Collectors.toList());
+            if (!datalakeKeys.isEmpty()) {
+                // Allow log tables without bucket keys to enable datalake even when
+                // `table.datalake.format` was not recorded at creation time, because bucket
+                // distribution does not need to stay aligned with the lake format in this case.
+                boolean alterLegacyLogTableWithoutBucketKey =
+                        !currentTable.hasPrimaryKey()
+                                && !currentTable.hasBucketKey()
+                                && datalakeKeys.stream()
+                                        .allMatch(
+                                                k ->
+                                                        k.equals(
+                                                                ConfigOptions.TABLE_DATALAKE_ENABLED
+                                                                        .key()));
+                if (alterLegacyLogTableWithoutBucketKey) {
+                    return;
+                }
+
+                throw new InvalidAlterTableException(
+                        String.format(
+                                "The following options cannot be altered for tables that were"
+                                        + " created before the Fluss cluster enabled datalake: %s.",
+                                datalakeKeys.stream()
+                                        .map(k -> "'" + k + "'")
+                                        .collect(Collectors.joining(", "))));
+            }
         }
     }
 

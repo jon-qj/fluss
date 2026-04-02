@@ -157,6 +157,7 @@ class CoordinatorEventProcessorTest {
     private CompletedSnapshotStoreManager completedSnapshotStoreManager;
     private CoordinatorMetadataCache serverMetadataCache;
     private KvSnapshotLeaseManager kvSnapshotLeaseManager;
+    private String remoteDataDir;
 
     @BeforeAll
     static void baseBeforeAll() throws Exception {
@@ -194,9 +195,10 @@ class CoordinatorEventProcessorTest {
         testCoordinatorChannelManager = new TestCoordinatorChannelManager();
         autoPartitionManager =
                 new AutoPartitionManager(serverMetadataCache, metadataManager, new Configuration());
-        lakeTableTieringManager = new LakeTableTieringManager();
+        lakeTableTieringManager =
+                new LakeTableTieringManager(TestingMetricGroups.LAKE_TIERING_METRICS);
         Configuration conf = new Configuration();
-        String remoteDataDir = "/tmp/fluss/remote-data";
+        remoteDataDir = zookeeperClient.getDefaultRemoteDataDir();
         conf.setString(ConfigOptions.REMOTE_DATA_DIR, remoteDataDir);
         kvSnapshotLeaseManager =
                 new KvSnapshotLeaseManager(
@@ -415,7 +417,7 @@ class CoordinatorEventProcessorTest {
         BucketState t1Bucket0State = fromCtx(ctx -> ctx.getBucketState(t1Bucket0));
         assertThat(t1Bucket0State).isEqualTo(OnlineBucket);
         // t1 bucket 1 should reelect a leader since the leader is not alive
-        // the bucket whose leader is in the server should be online a again, but the leadership
+        // the bucket whose leader is in the server should be online again, but the leadership
         // should change the leader for bucket2 of t1 should change since the leader fail
         BucketState t1Bucket1State = fromCtx(ctx -> ctx.getBucketState(t1Bucket1));
         assertThat(t1Bucket1State).isEqualTo(OnlineBucket);
@@ -1107,9 +1109,19 @@ class CoordinatorEventProcessorTest {
         String partition1Name = "2024";
         String partition2Name = "2025";
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                partition1Id, partition1Name, partitionAssignment, tablePath, tableId);
+                partition1Id,
+                partition1Name,
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId);
         zookeeperClient.registerPartitionAssignmentAndMetadata(
-                partition2Id, partition2Name, partitionAssignment, tablePath, tableId);
+                partition2Id,
+                partition2Name,
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId);
 
         return Tuple2.of(
                 new PartitionIdName(partition1Id, partition1Name),

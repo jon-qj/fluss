@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -46,6 +47,7 @@ import org.apache.fluss.server.zk.data.CoordinatorAddress;
 import org.apache.fluss.server.zk.data.DatabaseRegistration;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ResourceAcl;
@@ -60,7 +62,6 @@ import org.apache.fluss.server.zk.data.ZkData.BucketRemoteLogsZNode;
 import org.apache.fluss.server.zk.data.ZkData.BucketSnapshotIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.BucketSnapshotsZNode;
 import org.apache.fluss.server.zk.data.ZkData.ConfigEntityZNode;
-import org.apache.fluss.server.zk.data.ZkData.CoordinatorZNode;
 import org.apache.fluss.server.zk.data.ZkData.DatabaseZNode;
 import org.apache.fluss.server.zk.data.ZkData.DatabasesZNode;
 import org.apache.fluss.server.zk.data.ZkData.KvSnapshotLeaseZNode;
@@ -150,6 +151,8 @@ public class ZooKeeperClient implements AutoCloseable {
     private final Semaphore inFlightRequests;
     private final Configuration configuration;
 
+    private final String defaultRemoteDataDir;
+
     public ZooKeeperClient(
             CuratorFrameworkWithUnhandledErrorListener curatorFrameworkWrapper,
             Configuration configuration) {
@@ -164,6 +167,8 @@ public class ZooKeeperClient implements AutoCloseable {
                 configuration.getInt(ConfigOptions.ZOOKEEPER_MAX_INFLIGHT_REQUESTS);
         this.inFlightRequests = new Semaphore(maxInFlightRequests);
         this.configuration = configuration;
+
+        this.defaultRemoteDataDir = FlussConfigUtils.getDefaultRemoteDataDir(configuration);
     }
 
     public Optional<byte[]> getOrEmpty(String path) throws Exception {
@@ -174,24 +179,46 @@ public class ZooKeeperClient implements AutoCloseable {
         }
     }
 
+    public String getDefaultRemoteDataDir() {
+        return defaultRemoteDataDir;
+    }
+
     // --------------------------------------------------------------------------------------------
     // Coordinator server
     // --------------------------------------------------------------------------------------------
 
-    /** Register a coordinator leader server to ZK. */
-    public void registerCoordinatorLeader(CoordinatorAddress coordinatorAddress) throws Exception {
-        String path = CoordinatorZNode.path();
+    /** Register a coordinator server to ZK. */
+    public void registerCoordinatorServer(CoordinatorAddress coordinatorAddress) throws Exception {
+        String path = ZkData.CoordinatorIdZNode.path(coordinatorAddress.getId());
         zkClient.create()
                 .creatingParentsIfNeeded()
                 .withMode(CreateMode.EPHEMERAL)
-                .forPath(path, CoordinatorZNode.encode(coordinatorAddress));
-        LOG.info("Registered leader {} at path {}.", coordinatorAddress, path);
+                .forPath(path, ZkData.CoordinatorIdZNode.encode(coordinatorAddress));
+        LOG.info("Registered Coordinator server {} at path {}.", coordinatorAddress, path);
+    }
+
+    /** Register a coordinator leader to ZK. */
+    public void registerCoordinatorLeader(CoordinatorAddress coordinatorAddress) throws Exception {
+        String path = ZkData.CoordinatorLeaderZNode.path();
+        zkClient.create()
+                .creatingParentsIfNeeded()
+                .withMode(CreateMode.EPHEMERAL)
+                .forPath(path, ZkData.CoordinatorLeaderZNode.encode(coordinatorAddress));
+        LOG.info("Registered Coordinator leader {} at path {}.", coordinatorAddress, path);
     }
 
     /** Get the leader address registered in ZK. */
-    public Optional<CoordinatorAddress> getCoordinatorAddress() throws Exception {
-        Optional<byte[]> bytes = getOrEmpty(CoordinatorZNode.path());
-        return bytes.map(CoordinatorZNode::decode);
+    public Optional<CoordinatorAddress> getCoordinatorLeaderAddress() throws Exception {
+        Optional<byte[]> bytes = getOrEmpty(ZkData.CoordinatorLeaderZNode.path());
+        return bytes.map(
+                data ->
+                        // maybe an empty node when a leader is elected but not registered
+                        data.length == 0 ? null : ZkData.CoordinatorLeaderZNode.decode(data));
+    }
+
+    /** Gets the list of coordinator server Ids. */
+    public List<String> getCoordinatorServerList() throws Exception {
+        return getChildren(ZkData.CoordinatorIdsZNode.path());
     }
 
     // --------------------------------------------------------------------------------------------
@@ -472,6 +499,13 @@ public class ZooKeeperClient implements AutoCloseable {
         LOG.info("Registered database {}", database);
     }
 
+    public void updateDatabase(String database, DatabaseRegistration databaseRegistration)
+            throws Exception {
+        String path = DatabaseZNode.path(database);
+        zkClient.setData().forPath(path, DatabaseZNode.encode(databaseRegistration));
+        LOG.info("Updated database {}", database);
+    }
+
     /** Get the database in ZK. */
     public Optional<DatabaseRegistration> getDatabase(String database) throws Exception {
         String path = DatabaseZNode.path(database);
@@ -495,29 +529,50 @@ public class ZooKeeperClient implements AutoCloseable {
 
     public List<DatabaseSummary> listDatabaseSummaries(Collection<String> databaseNames)
             throws Exception {
-        Map<String, String> path2DatabaseNamesMap =
+        Map<String, String> dbPathToDatabaseName =
                 databaseNames.stream()
                         .collect(toMap(DatabaseZNode::path, databaseName -> databaseName));
-        List<ZkCheckExistsResponse> statsInBackground =
-                getStatInBackground(path2DatabaseNamesMap.keySet());
+        Map<String, String> tablesPathToDatabaseName =
+                databaseNames.stream()
+                        .collect(toMap(TablesZNode::path, databaseName -> databaseName));
+        List<String> requestPaths = new ArrayList<>(dbPathToDatabaseName.keySet());
+        requestPaths.addAll(tablesPathToDatabaseName.keySet());
+        List<ZkCheckExistsResponse> statResponses = getStatInBackground(requestPaths);
+
         List<DatabaseSummary> databaseSummaries = new ArrayList<>();
-        for (ZkCheckExistsResponse response : statsInBackground) {
+
+        Map<String, Long> dbCreatedTimes = new HashMap<>();
+        Map<String, Integer> dbTableCounts = new HashMap<>();
+        for (ZkCheckExistsResponse response : statResponses) {
             Stat stat = response.getStat();
+            String path = response.getPath();
             if (!response.hasError() && stat != null) {
-                // To decrease the cost, use zk node creation time as the database creation
-                // time rather than create_time in node data.
+                if (dbPathToDatabaseName.containsKey(path)) {
+                    // Use zk node creation time as the database creation time to avoid reading
+                    // node data.
+                    dbCreatedTimes.put(dbPathToDatabaseName.get(path), stat.getCtime());
+                } else {
+                    dbTableCounts.put(tablesPathToDatabaseName.get(path), stat.getNumChildren());
+                }
+            } else if (response.getResultCode().equals(KeeperException.Code.NONODE)
+                    && tablesPathToDatabaseName.containsKey(path)) {
+                dbTableCounts.put(tablesPathToDatabaseName.get(path), 0);
+            } else {
+                LOG.warn(
+                        "Failed to get database summary for database {}: {}",
+                        path,
+                        response.getErrorMessage());
+            }
+        }
+
+        for (String databaseName : databaseNames) {
+            if (dbCreatedTimes.containsKey(databaseName)
+                    && dbTableCounts.containsKey(databaseName)) {
                 databaseSummaries.add(
                         new DatabaseSummary(
-                                path2DatabaseNamesMap.get(response.getPath()),
-                                response.getStat().getCtime(),
-                                response.getStat().getNumChildren()));
-            } else {
-                // silently ignore the database which does not exist anymore,
-                // because the database names are listed by server not user
-                LOG.warn(
-                        "Failed to get database summary for database {}. {}",
-                        path2DatabaseNamesMap.get(response.getPath()),
-                        response.getErrorMessage());
+                                databaseName,
+                                dbCreatedTimes.get(databaseName),
+                                dbTableCounts.get(databaseName)));
             }
         }
         return databaseSummaries;
@@ -576,7 +631,11 @@ public class ZooKeeperClient implements AutoCloseable {
     /** Get the table in ZK. */
     public Optional<TableRegistration> getTable(TablePath tablePath) throws Exception {
         Optional<byte[]> bytes = getOrEmpty(TableZNode.path(tablePath));
-        return bytes.map(TableZNode::decode);
+        Optional<TableRegistration> tableRegistration = bytes.map(TableZNode::decode);
+        // Set the default remote data dir for a node generated by an older version which does not
+        // have remote data dir
+        return tableRegistration.map(
+                t -> t.remoteDataDir == null ? t.newRemoteDataDir(defaultRemoteDataDir) : t);
     }
 
     /** Get the tables in ZK. */
@@ -589,7 +648,17 @@ public class ZooKeeperClient implements AutoCloseable {
         return processGetDataResponses(
                 responses,
                 response -> path2TablePathMap.get(response.getPath()),
-                TableZNode::decode,
+                (data) -> {
+                    TableRegistration tableRegistration = TableZNode.decode(data);
+                    // Set the default remote data dir for a node generated by an older version
+                    // which does not
+                    // have remote data dir
+                    if (tableRegistration.remoteDataDir == null) {
+                        tableRegistration =
+                                tableRegistration.newRemoteDataDir(defaultRemoteDataDir);
+                    }
+                    return tableRegistration;
+                },
                 "tables registration");
     }
 
@@ -681,13 +750,13 @@ public class ZooKeeperClient implements AutoCloseable {
                 "partitions for tables");
     }
 
-    /** Get the partition and the id for the partitions of a table in ZK. */
-    public Map<String, Long> getPartitionNameAndIds(TablePath tablePath) throws Exception {
-        Map<String, Long> partitions = new HashMap<>();
+    /** Get the partition registrations of a table in ZK. */
+    public Map<String, PartitionRegistration> getPartitionRegistrations(TablePath tablePath)
+            throws Exception {
+        Map<String, PartitionRegistration> partitions = new HashMap<>();
         for (String partitionName : getPartitions(tablePath)) {
-            Optional<TablePartition> optPartition = getPartition(tablePath, partitionName);
-            optPartition.ifPresent(
-                    partition -> partitions.put(partitionName, partition.getPartitionId()));
+            Optional<PartitionRegistration> optPartition = getPartition(tablePath, partitionName);
+            optPartition.ifPresent(partition -> partitions.put(partitionName, partition));
         }
         return partitions;
     }
@@ -731,22 +800,22 @@ public class ZooKeeperClient implements AutoCloseable {
         return result;
     }
 
-    /** Get the partition and the id for the partitions of a table in ZK by partition spec. */
-    public Map<String, Long> getPartitionNameAndIds(
+    /** Get the partition registrations of a table in ZK by partition spec. */
+    public Map<String, PartitionRegistration> getPartitionRegistrations(
             TablePath tablePath,
             List<String> partitionKeys,
             ResolvedPartitionSpec partialPartitionSpec)
             throws Exception {
-        Map<String, Long> partitions = new HashMap<>();
+        Map<String, PartitionRegistration> partitions = new HashMap<>();
 
         for (String partitionName : getPartitions(tablePath)) {
             ResolvedPartitionSpec resolvedPartitionSpec =
                     fromPartitionName(partitionKeys, partitionName);
             boolean contains = resolvedPartitionSpec.contains(partialPartitionSpec);
             if (contains) {
-                Optional<TablePartition> optPartition = getPartition(tablePath, partitionName);
-                optPartition.ifPresent(
-                        partition -> partitions.put(partitionName, partition.getPartitionId()));
+                Optional<PartitionRegistration> optPartition =
+                        getPartition(tablePath, partitionName);
+                optPartition.ifPresent(partition -> partitions.put(partitionName, partition));
             }
         }
 
@@ -790,10 +859,15 @@ public class ZooKeeperClient implements AutoCloseable {
     }
 
     /** Get a partition of a table in ZK. */
-    public Optional<TablePartition> getPartition(TablePath tablePath, String partitionName)
+    public Optional<PartitionRegistration> getPartition(TablePath tablePath, String partitionName)
             throws Exception {
         String path = PartitionZNode.path(tablePath, partitionName);
-        return getOrEmpty(path).map(PartitionZNode::decode);
+        Optional<PartitionRegistration> partitionRegistration =
+                getOrEmpty(path).map(PartitionZNode::decode);
+        // Set the default remote data dir for a node generated by an older version which does not
+        // have remote data dir
+        return partitionRegistration.map(
+                p -> p.getRemoteDataDir() == null ? p.newRemoteDataDir(defaultRemoteDataDir) : p);
     }
 
     /** Get partition id and table id for each partition in a batch async way. */
@@ -813,7 +887,7 @@ public class ZooKeeperClient implements AutoCloseable {
         return processGetDataResponses(
                 responses,
                 response -> path2PartitionPathMap.get(response.getPath()),
-                PartitionZNode::decode,
+                (byte[] data) -> PartitionZNode.decode(data).toTablePartition(),
                 "partition");
     }
 
@@ -838,6 +912,7 @@ public class ZooKeeperClient implements AutoCloseable {
             long partitionId,
             String partitionName,
             PartitionAssignment partitionAssignment,
+            String remoteDataDir,
             TablePath tablePath,
             long tableId)
             throws Exception {
@@ -883,12 +958,15 @@ public class ZooKeeperClient implements AutoCloseable {
                         .withMode(CreateMode.PERSISTENT)
                         .forPath(
                                 metadataPath,
-                                PartitionZNode.encode(new TablePartition(tableId, partitionId)));
+                                PartitionZNode.encode(
+                                        new PartitionRegistration(
+                                                tableId, partitionId, remoteDataDir)));
 
         ops.add(tabletServerPartitionNode);
         ops.add(metadataPartitionNode);
         zkClient.transaction().forOperations(ops);
     }
+
     // --------------------------------------------------------------------------------------------
     // Schema
     // --------------------------------------------------------------------------------------------
